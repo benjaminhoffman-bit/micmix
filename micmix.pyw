@@ -1,494 +1,199 @@
-"""MicMix: your microphone plus one app's sound (or everything on an output) in one virtual mic, with a slider.
+"""MicMix: your microphone plus one app's sound (or everything on an output), a soundboard and a noise gate, in one
+virtual mic for Discord, with a slider between voice and music and keybinds that work from any app.
 
-Mic + music go to "Send to". Make that a virtual cable (VB-Audio's free VB-Cable: "CABLE Input") and pick the cable's
-other end ("CABLE Output") as the microphone in Discord. The slider fades voice <-> music; both are full at the middle.
-"Music from" takes one app (Spotify, a browser, your MP3 player) as OBS's Application Audio Capture does, so game
-sounds and Discord stay out; or everything playing on one output device, as OBS's Desktop Audio does.
+Mic + music + sounds go to "Send to". Make that a virtual cable (VB-Audio's free VB-CABLE: "CABLE Input") and pick
+the cable's other end ("CABLE Output") as the microphone in Discord. The slider fades voice <-> music; both are full at
+the middle. "Music from" takes one app (Spotify, a browser, your MP3 player) as OBS's Application Audio Capture does,
+so game sounds and Discord stay out; or everything playing on one output device, as OBS's Desktop Audio does.
 
-Standard library only, all through ctypes: winmm (MME) for the mic and Send to, WASAPI loopback for the music.
-Needs no admin and changes no Windows setting. The picks and the slider are kept in micmix.json next to this file.
+This file is the window, the keybinds and the installer's helpers; the sound is audio.py. Standard library only.
+The app needs no admin and changes no Windows setting. Picks, keybinds and the sliders are kept in micmix.json next to
+this file, sounds in sounds\\.
 """
 import contextlib
 import ctypes
 import json
 import math
 import os
+import queue
+import shutil
+import struct
+import sys
 import threading
+import time
 import tkinter as tk
-import uuid
-from array import array
+import tkinter.font as tkfont
+import winreg
+import zlib
 from ctypes import wintypes as w
 from pathlib import Path
-from tkinter import ttk
-from types import SimpleNamespace
-
-RATE, CHANNELS = 48000, 2  # Discord and VB-Cable run at 48 kHz; Windows converts for any other device
-BLOCK = RATE // 50 * CHANNELS * 2  # bytes in 20 ms of 16-bit stereo
-SILENCE = bytes(BLOCK)
-MIC_BUFS, OUT_BUFS, PAD = 8, 6, 2  # 160 ms of mic buffers; at most 120 ms queued to Send to; 40 ms cushion after a gap
-WAVE_MAPPER, CALLBACK_EVENT, WHDR_DONE = 0xFFFFFFFF, 0x50000, 1
-ENDPOINT_ID, ENDPOINT_ID_SIZE, PREFERRED_GET = 0x811, 0x812, 0x2015  # waveOutMessage: DRV_QUERYFUNCTIONINSTANCEID...
-LOOPBACK_FLAGS, BUFFER_SILENT, CLSCTX_ALL = 0x88020000, 2, 23  # LOOPBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY
-VT_BLOB, PROCESS_LOOPBACK, E_NOINTERFACE = 65, 1, -2147467262
-DEFAULT, OFF = "Windows default", "Off"
-SETTINGS = Path(__file__).with_suffix(".json")
-
-winmm, kernel32, ole32 = ctypes.WinDLL("winmm"), ctypes.WinDLL("kernel32"), ctypes.WinDLL("ole32")
-mmdevapi = ctypes.WinDLL("mmdevapi")
-
-
-class WAVEFORMATEX(ctypes.Structure):
-    _fields_ = [("wFormatTag", w.WORD), ("nChannels", w.WORD), ("nSamplesPerSec", w.DWORD),
-                ("nAvgBytesPerSec", w.DWORD), ("nBlockAlign", w.WORD), ("wBitsPerSample", w.WORD), ("cbSize", w.WORD)]
-
-
-class WAVEHDR(ctypes.Structure):
-    _fields_ = [("lpData", ctypes.c_void_p), ("dwBufferLength", w.DWORD), ("dwBytesRecorded", w.DWORD),
-                ("dwUser", ctypes.c_size_t), ("dwFlags", w.DWORD), ("dwLoops", w.DWORD),
-                ("lpNext", ctypes.c_void_p), ("reserved", ctypes.c_size_t)]
-
-
-class CAPS(ctypes.Structure):  # WAVEOUTCAPSW; WAVEINCAPSW is the same without dwSupport
-    _fields_ = [("wMid", w.WORD), ("wPid", w.WORD), ("vDriverVersion", w.UINT), ("szPname", w.WCHAR * 32),
-                ("dwFormats", w.DWORD), ("wChannels", w.WORD), ("wReserved1", w.WORD), ("dwSupport", w.DWORD)]
-
-
-class PROPVARIANT(ctypes.Structure):  # only its VT_BLOB form
-    _fields_ = [("vt", w.WORD), ("reserved", w.WORD * 3), ("cbSize", w.ULONG), ("pBlobData", ctypes.c_void_p)]
-
-
-class LOOPBACK_PARAMS(ctypes.Structure):  # AUDIOCLIENT_ACTIVATION_PARAMS, in its process loopback form
-    _fields_ = [("ActivationType", ctypes.c_int), ("TargetProcessId", w.DWORD), ("ProcessLoopbackMode", ctypes.c_int)]
-
-
-class PROCESSENTRY32W(ctypes.Structure):
-    _fields_ = [("dwSize", w.DWORD), ("cntUsage", w.DWORD), ("th32ProcessID", w.DWORD),
-                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", w.DWORD), ("cntThreads", w.DWORD),
-                ("th32ParentProcessID", w.DWORD), ("pcPriClassBase", w.LONG), ("dwFlags", w.DWORD),
-                ("szExeFile", w.WCHAR * 260)]
-
-
-FORMAT = WAVEFORMATEX(1, CHANNELS, RATE, RATE * CHANNELS * 2, CHANNELS * 2, 16, 0)  # 1: plain PCM
-HDR, PTR = ctypes.POINTER(WAVEHDR), ctypes.POINTER(ctypes.c_void_p)
-for io in ("waveIn", "waveOut"):  # both APIs share these signatures; declared, so 64-bit handles pass whole
-    for name, args in {"Open": [ctypes.POINTER(w.HANDLE), w.UINT, ctypes.POINTER(WAVEFORMATEX), w.HANDLE,
-                                ctypes.c_size_t, w.DWORD],
-                       "PrepareHeader": [w.HANDLE, HDR, w.UINT], "UnprepareHeader": [w.HANDLE, HDR, w.UINT],
-                       "Reset": [w.HANDLE], "Close": [w.HANDLE], "GetNumDevs": [],
-                       "GetDevCapsW": [ctypes.c_size_t, ctypes.POINTER(CAPS), w.UINT],
-                       "GetErrorTextW": [w.UINT, w.LPWSTR, w.UINT],
-                       "Message": [w.HANDLE, w.UINT, ctypes.c_size_t, ctypes.c_size_t]}.items():
-        getattr(winmm, io + name).argtypes = args
-winmm.waveInAddBuffer.argtypes = winmm.waveOutWrite.argtypes = [w.HANDLE, HDR, w.UINT]
-winmm.waveInStart.argtypes = [w.HANDLE]
-kernel32.CreateEventW.restype = w.HANDLE
-kernel32.CreateEventW.argtypes = [ctypes.c_void_p, w.BOOL, w.BOOL, w.LPCWSTR]
-kernel32.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
-kernel32.CloseHandle.argtypes = [w.HANDLE]
-kernel32.CreateToolhelp32Snapshot.restype = w.HANDLE
-kernel32.CreateToolhelp32Snapshot.argtypes = [w.DWORD, w.DWORD]
-kernel32.Process32FirstW.argtypes = kernel32.Process32NextW.argtypes = [w.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, w.DWORD]
-ole32.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, w.DWORD, ctypes.c_void_p, PTR]
-ole32.CoCreateInstance.restype = ctypes.HRESULT
-mmdevapi.ActivateAudioInterfaceAsync.argtypes = [w.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, PTR]
-mmdevapi.ActivateAudioInterfaceAsync.restype = ctypes.HRESULT
-
-
-def guid(text: str) -> ctypes.Array:
-    return (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID(text).bytes_le)
-
-
-def com(index: int, *argtypes):
-    """COM method number `index` (vtable order in the Windows SDK headers); call it with the object first.
-    HRESULT failures raise OSError."""
-    return ctypes.WINFUNCTYPE(ctypes.HRESULT, *argtypes)(index, f"method{index}")
-
-
-ENUMERATOR, IMMDEVICEENUMERATOR = guid("BCDE0395-E52F-467C-8E3D-C4579291692E"), guid("A95664D2-9614-4F35-A746-DE8DB63617E6")
-IAUDIOCLIENT, IAUDIOCAPTURECLIENT = guid("1CB9AD4C-DBFA-4C32-B178-C2F568A703B2"), guid("C8ADBD64-E71E-48A0-A4DE-185C395CD317")
-IAUDIOSESSIONMANAGER2 = guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F")
-IAUDIOSESSIONCONTROL2 = guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D")
-HANDLER_IIDS = {uuid.UUID(i).bytes_le for i in ("00000000-0000-0000-C000-000000000046",  # IUnknown
-                                                 "41D949AB-9862-444A-80F6-C261334DA5EB",  # the completion handler
-                                                 "94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90")}  # IAgileObject: required
-query_interface, release = com(0, ctypes.c_void_p, PTR), ctypes.WINFUNCTYPE(ctypes.c_ulong)(2, "Release")  # IUnknown
-enum_endpoints, get_device = com(3, w.UINT, w.DWORD, PTR), com(5, w.LPCWSTR, PTR)  # IMMDeviceEnumerator
-device_count, device_item = com(3, ctypes.POINTER(w.UINT)), com(4, w.UINT, PTR)  # IMMDeviceCollection
-activate = com(3, ctypes.c_void_p, w.DWORD, ctypes.c_void_p, PTR)  # IMMDevice
-session_list = com(5, PTR)  # IAudioSessionManager2
-session_count, get_session = com(3, ctypes.POINTER(ctypes.c_int)), com(4, ctypes.c_int, PTR)  # IAudioSessionEnumerator
-session_pid = com(14, ctypes.POINTER(w.DWORD))  # IAudioSessionControl2
-activate_result = com(3, ctypes.POINTER(w.LONG), PTR)  # IActivateAudioInterfaceAsyncOperation
-initialize = com(3, ctypes.c_int, w.DWORD, ctypes.c_longlong, ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p)
-start, stop, get_service = com(10), com(11), com(14, ctypes.c_void_p, PTR)  # IAudioClient
-get_buffer = com(3, PTR, ctypes.POINTER(w.UINT), ctypes.POINTER(w.DWORD), ctypes.c_void_p, ctypes.c_void_p)
-release_buffer, next_packet = com(4, w.UINT), com(5, ctypes.POINTER(w.UINT))  # IAudioCaptureClient
-QUERY = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p, PTR)  # our one COM object's methods
-COUNT = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
-COMPLETED = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)
-# ponytail: activation handlers are never freed, so a late call from Windows can't land in freed memory;
-# a few hundred bytes each time you pick an app
-HANDLERS = []
-
-
-def devices(io: str) -> list[str]:
-    """Names of the "waveIn" or "waveOut" devices; a name's index is its device id. MME cuts names at 31 characters."""
-    caps, names = CAPS(), []
-    for i in range(getattr(winmm, io + "GetNumDevs")()):
-        failed = getattr(winmm, io + "GetDevCapsW")(i, ctypes.byref(caps), ctypes.sizeof(caps))
-        names.append(f"Device {i}" if failed else caps.szPname)
-    return names
-
-
-def device_id(io: str, name: str) -> int | None:
-    """A picked name's device id: WAVE_MAPPER for the Windows default, None for Off or a device that is gone."""
-    if name == DEFAULT:
-        return WAVE_MAPPER
-    names = devices(io)
-    return names.index(name) if name in names else None
-
-
-def default_device(io: str) -> int:
-    """The MME id of the Windows default "waveIn" or "waveOut" device."""
-    dev, flags = w.DWORD(), w.DWORD()
-    getattr(winmm, io + "Message")(WAVE_MAPPER, PREFERRED_GET, ctypes.addressof(dev), ctypes.addressof(flags))
-    return dev.value
-
-
-def processes() -> dict[int, tuple[str, int]]:
-    """pid -> (exe name, parent pid) for every running process."""
-    snap, entry, found = kernel32.CreateToolhelp32Snapshot(2, 0), PROCESSENTRY32W(), {}  # 2: TH32CS_SNAPPROCESS
-    entry.dwSize = ctypes.sizeof(entry)
-    more = kernel32.Process32FirstW(snap, ctypes.byref(entry))
-    while more:
-        found[entry.th32ProcessID] = entry.szExeFile, entry.th32ParentProcessID
-        more = kernel32.Process32NextW(snap, ctypes.byref(entry))
-    kernel32.CloseHandle(snap)
-    return found
-
-
-def is_app(name: str) -> bool:
-    """A Music from pick is an app (its exe name, in any case) rather than a whole device."""
-    return name.lower().endswith(".exe")
-
-
-def app_pid(exe: str) -> int | None:
-    """The top process of exe's tree: the tree includes the helper processes that play the sound for Chrome, Spotify
-    and the like. Of several separate trees, the one with sound open wins. Never MicMix itself, whose output would
-    loop back in."""
-    procs, exe = processes(), exe.lower()
-    named = lambda pid: procs.get(pid, ("",))[0].lower() == exe  # noqa: E731
-
-    def top(pid: int) -> int:
-        for _ in range(64):  # bounded: a reused pid could make a loop
-            if not named(procs[pid][1]):
-                break
-            pid = procs[pid][1]
-        return pid
-
-    tops = [top(p) for p in session_pids() if named(p)] + [p for p, (_, parent) in procs.items()
-                                                           if named(p) and not named(parent)]
-    return next((p for p in tops if p != os.getpid()), None)
-
-
-def playing_apps() -> list[str]:
-    """Apps with sound open on any output device, as Windows' volume mixer lists them; never Discord or MicMix."""
-    procs = processes()
-    names = {procs[p][0] for p in session_pids() - {0, os.getpid()} if p in procs}
-    return sorted((name for name in names if "discord" not in name.lower()), key=str.lower)
-
-
-def session_pids() -> set[int]:
-    """The processes with a sound session on any output device."""
-    ole32.CoInitializeEx(None, 2)  # apartment COM for the window's thread; a harmless no-op where COM is on
-    objects, pids, n = [], set(), w.UINT()
-
-    def new() -> ctypes.c_void_p:  # every COM object made here, released at the end
-        objects.append(ctypes.c_void_p())
-        return objects[-1]
-
-    try:
-        with contextlib.suppress(OSError):  # whatever fails just lists less
-            enum, outputs = new(), new()
-            ole32.CoCreateInstance(ENUMERATOR, None, CLSCTX_ALL, IMMDEVICEENUMERATOR, ctypes.byref(enum))
-            enum_endpoints(enum, 0, 1, ctypes.byref(outputs))  # outputs (0) that are on (1)
-            device_count(outputs, ctypes.byref(n))
-            for i in range(n.value):
-                device, manager, sessions, count = new(), new(), new(), ctypes.c_int()
-                device_item(outputs, i, ctypes.byref(device))
-                activate(device, IAUDIOSESSIONMANAGER2, CLSCTX_ALL, None, ctypes.byref(manager))
-                session_list(manager, ctypes.byref(sessions))
-                session_count(sessions, ctypes.byref(count))
-                for j in range(count.value):
-                    control, control2, pid = new(), new(), w.DWORD()
-                    get_session(sessions, j, ctypes.byref(control))
-                    query_interface(control, IAUDIOSESSIONCONTROL2, ctypes.byref(control2))
-                    session_pid(control2, ctypes.byref(pid))
-                    pids.add(pid.value)
-    finally:
-        for obj in reversed(objects):
-            if obj:
-                release(obj)
-    return pids
-
-
-def gains(fade: float) -> tuple[float, float]:
-    """Slider 0 (voice only) .. 1 (music only) -> (voice, music) gains. Both are full at the middle; squared, so the
-    quiet end of each fade gets most of the slider's travel (music under your voice sits around 0.1-0.2)."""
-    return min(1.0, 2 - 2 * fade) ** 2, min(1.0, 2 * fade) ** 2
-
-
-def mix(voice: bytes, music: bytes, vg: float, mg: float) -> bytes:
-    """voice*vg + music*mg, clipped to 16 bits."""
-    v, m = round(vg * 32768), round(mg * 32768)  # gains in 1/32768ths: integer math, exact at 0 and 1
-    return array("h", [min(32767, max(-32768, (x * v + y * m) >> 15))
-                       for x, y in zip(array("h", voice), array("h", music))]).tobytes()
-
-
-class Wave:
-    """One open MME device and its ring of 20 ms buffers, which Windows fills (Mic) or plays (Speaker)."""
-    io = ""
-
-    def __init__(self, dev: int, count: int, label: str):
-        self.label, self.handle = label, w.HANDLE()
-        self.event = kernel32.CreateEventW(None, False, False, None)
-        self.call("Open", ctypes.byref(self.handle), dev, ctypes.byref(FORMAT), self.event, 0, CALLBACK_EVENT)
-        self.bufs = [ctypes.create_string_buffer(BLOCK) for _ in range(count)]
-        self.hdrs = [WAVEHDR(ctypes.addressof(b), BLOCK) for b in self.bufs]
-        for h in self.hdrs:
-            self.call("PrepareHeader", self.handle, h, ctypes.sizeof(h))
-
-    def call(self, name: str, *args) -> None:
-        if err := getattr(winmm, self.io + name)(*args):
-            text = ctypes.create_unicode_buffer(256)
-            getattr(winmm, self.io + "GetErrorTextW")(err, text, 256)
-            raise OSError(f"{self.label}: {text.value or f'error {err}'}")
-
-    def close(self) -> None:
-        with contextlib.suppress(OSError):
-            self.call("Reset", self.handle)  # hands every buffer back
-            for h in self.hdrs:
-                self.call("UnprepareHeader", self.handle, h, ctypes.sizeof(h))
-            self.call("Close", self.handle)
-        kernel32.CloseHandle(self.event)
-
-
-class Mic(Wave):
-    io = "waveIn"
-
-    def __init__(self, dev: int):
-        super().__init__(dev, MIC_BUFS, "Microphone")
-        for h in self.hdrs:
-            self.call("AddBuffer", self.handle, h, ctypes.sizeof(h))
-        self.call("Start", self.handle)
-        self.next = 0
-
-    def read(self) -> bytes | None:
-        """The next 20 ms from the mic, or None when it isn't there yet (just ask again)."""
-        h = self.hdrs[self.next]
-        if not h.dwFlags & WHDR_DONE:
-            kernel32.WaitForSingleObject(self.event, 500)
-            if not h.dwFlags & WHDR_DONE:
-                return None
-        data = self.bufs[self.next].raw
-        h.dwFlags &= ~WHDR_DONE
-        self.call("AddBuffer", self.handle, h, ctypes.sizeof(h))
-        self.next = (self.next + 1) % MIC_BUFS
-        return data
-
-
-class Speaker(Wave):
-    io = "waveOut"
-
-    def __init__(self, dev: int):
-        super().__init__(dev, OUT_BUFS, "Send to")
-        for h in self.hdrs:
-            h.dwFlags |= WHDR_DONE  # done = free to fill
-
-    def write(self, data: bytes) -> None:
-        free = [h for h in self.hdrs if h.dwFlags & WHDR_DONE]
-        # ponytail: the mic's clock paces the output, so drift between the two clocks costs a 20 ms gap or skip every
-        # few minutes; resample against the queue depth if that ever becomes audible
-        if len(free) == OUT_BUFS:  # ran dry (just opened, or a stall): cushion it so the next hiccup isn't a click
-            for _ in range(PAD):
-                self.send(free.pop(), SILENCE)
-        if free:
-            self.send(free.pop(), data)
-
-    def send(self, h: WAVEHDR, data: bytes) -> None:
-        ctypes.memmove(h.lpData, data, BLOCK)
-        h.dwFlags &= ~WHDR_DONE
-        self.call("Write", self.handle, h, ctypes.sizeof(h))
-
-
-class Activated:
-    """The callback object ActivateAudioInterfaceAsync needs (IUnknown, the completion handler and IAgileObject),
-    built from ctypes callbacks. All it does is say "done"."""
-
-    def __init__(self):
-        self.done = threading.Event()
-
-        def query(this, iid, out):
-            known = ctypes.string_at(iid, 16) in HANDLER_IIDS
-            out[0] = this if known else None
-            return 0 if known else E_NOINTERFACE
-
-        def completed(this, operation):
-            self.done.set()
-            return 0
-
-        self.methods = [QUERY(query), COUNT(lambda this: 1), COUNT(lambda this: 1), COMPLETED(completed)]
-        self.vtable = (ctypes.c_void_p * 4)(*(ctypes.cast(m, ctypes.c_void_p) for m in self.methods))
-        self.object = ctypes.c_void_p(ctypes.addressof(self.vtable))  # a COM object starts with its vtable's address
-        HANDLERS.append(self)
-
-
-def app_client(pid: int) -> ctypes.c_void_p:
-    """An IAudioClient that hears only process pid and its children (process loopback: Windows 10 2004 and later)."""
-    params = LOOPBACK_PARAMS(PROCESS_LOOPBACK, pid, 0)  # mode 0: include the process tree
-    blob = PROPVARIANT(VT_BLOB, (0, 0, 0), ctypes.sizeof(params), ctypes.addressof(params))
-    handler, op, unknown, client, result = Activated(), ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p(), w.LONG()
-    try:
-        mmdevapi.ActivateAudioInterfaceAsync("VAD\\Process_Loopback", IAUDIOCLIENT, ctypes.byref(blob),
-                                              ctypes.byref(handler.object), ctypes.byref(op))
-        if not handler.done.wait(5):
-            raise OSError("Windows did not open the app's sound")
-        activate_result(op, ctypes.byref(result), ctypes.byref(unknown))
-        if result.value < 0:
-            raise ctypes.WinError(result.value)
-        query_interface(unknown, IAUDIOCLIENT, ctypes.byref(client))
-    finally:
-        for obj in (unknown, op):
-            if obj:
-                release(obj)
-    return client
-
-
-def device_client(dev: int) -> ctypes.c_void_p:
-    """An IAudioClient on the WASAPI endpoint behind MME output dev (MME reports each of its devices' endpoint id)."""
-    size = ctypes.c_size_t()
-    winmm.waveOutMessage(dev, ENDPOINT_ID_SIZE, ctypes.addressof(size), 0)
-    endpoint = ctypes.create_unicode_buffer(size.value // 2 + 1)
-    winmm.waveOutMessage(dev, ENDPOINT_ID, ctypes.addressof(endpoint), size.value)
-    enum, device, client = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-    try:
-        ole32.CoCreateInstance(ENUMERATOR, None, CLSCTX_ALL, IMMDEVICEENUMERATOR, ctypes.byref(enum))
-        get_device(enum, endpoint.value, ctypes.byref(device))
-        activate(device, IAUDIOCLIENT, CLSCTX_ALL, None, ctypes.byref(client))
-    finally:
-        for obj in (device, enum):
-            if obj:
-                release(obj)
-    return client
-
-
-class Loopback:
-    """The music, 20 ms at a time: one app's sound (source = its exe name, as OBS's Application Audio Capture) or
-    everything on an output device (source = its MME id, as OBS's Desktop Audio).
-    Lives on the sound thread: COM is started for that thread here."""
-
-    def __init__(self, source: int | str):
-        ole32.CoInitializeEx(None, 0)  # multithreaded
-        self.client, self.capture = ctypes.c_void_p(), ctypes.c_void_p()
-        self.buf, self.flowing = bytearray(), False
-        try:
-            if isinstance(source, str):
-                pid = app_pid(source)
-                if pid is None:
-                    raise OSError(f"{source} isn't running. Start it, then pick it again")
-                self.client = app_client(pid)
-            else:
-                self.client = device_client(source)
-            initialize(self.client, 0, LOOPBACK_FLAGS, 2_000_000, 0, ctypes.byref(FORMAT), None)  # 200 ms buffer
-            get_service(self.client, IAUDIOCAPTURECLIENT, ctypes.byref(self.capture))
-            start(self.client)
-        except OSError as e:
-            self.close()
-            raise OSError(f"Music from: {e}") from e
-
-    def block(self) -> bytes:
-        """The next 20 ms. Silence while nothing plays: loopback then delivers nothing at all."""
-        n, data, frames, flags = w.UINT(), ctypes.c_void_p(), w.UINT(), w.DWORD()
-        next_packet(self.capture, ctypes.byref(n))
-        while n.value:
-            get_buffer(self.capture, ctypes.byref(data), ctypes.byref(frames), ctypes.byref(flags), None, None)
-            size = frames.value * CHANNELS * 2
-            self.buf += bytes(size) if flags.value & BUFFER_SILENT else ctypes.string_at(data, size)
-            release_buffer(self.capture, frames.value)
-            next_packet(self.capture, ctypes.byref(n))
-        # ponytail: the music runs on its device's clock, not the mic's. A 40 ms cushion soaks up jitter and drift
-        # gets trimmed (a 20-80 ms skip now and then); resample if that ever shows
-        if len(self.buf) > 6 * BLOCK:
-            del self.buf[:-2 * BLOCK]
-        if len(self.buf) < (BLOCK if self.flowing else 2 * BLOCK):
-            self.flowing = False
-            return SILENCE
-        self.flowing, chunk = True, bytes(self.buf[:BLOCK])
-        del self.buf[:BLOCK]
-        return chunk
-
-    def close(self) -> None:
-        if self.client:
-            with contextlib.suppress(OSError):
-                stop(self.client)
-        for obj in (self.capture, self.client):
-            if obj:
-                release(obj)
-        ole32.CoUninitialize()
-
-
-class Engine(threading.Thread):
-    """Mic in, music on top, out to Send to. The mic's clock paces it all.
-    `shared` is what the window sets (gain) and reads back (peak); each field is swapped whole."""
-
-    def __init__(self, shared: SimpleNamespace, mic: int, out: int, music: int | str | None):
+from tkinter import filedialog, ttk
+
+import audio
+from audio import DEFAULT, OFF
+
+HERE = Path(__file__).resolve().parent
+SETTINGS, SOUNDS = HERE / "micmix.json", HERE / "sounds"
+SOUND_TYPES = {".mp3", ".wav", ".m4a", ".aac", ".wma", ".flac", ".ogg", ".opus"}  # what Windows may decode
+ACTIONS = {"mute": "Mute or unmute your mic", "music": "Music on or off", "up": "Music up", "down": "Music down",
+           "stop": "Stop sounds"}
+GATE_OFF = -72  # the noise gate slider's far left (dBFS): off. The mic meter under it uses the same scale
+MODIFIERS = ((0x11, 2, "Ctrl"), (0x12, 1, "Alt"), (0x10, 4, "Shift"), (0x5B, 8, "Win"), (0x5C, 8, "Win"))
+WM_HOTKEY, WM_QUIT, WM_CLOSE, MOD_NOREPEAT = 0x312, 0x12, 0x10, 0x4000
+APP_ID, TRAY_CLASS, WM_TRAY, WM_SHOW = "SilvaDes.MicMix", "MicMixTray", 0x8001, 0x8002  # WM_APP + 1, + 2
+WM_LBUTTONUP, WM_RBUTTONUP, MF_CHECKED, MF_SEPARATOR, TPM_RETURNCMD = 0x202, 0x205, 0x8, 0x800, 0x100
+NIM_ADD, NIM_MODIFY, NIM_DELETE, NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 0, 1, 2, 1, 2, 4, 0x10
+WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [("cbSize", w.DWORD), ("hWnd", w.HWND), ("uID", w.UINT), ("uFlags", w.UINT), ("uCallbackMessage", w.UINT),
+                ("hIcon", w.HICON), ("szTip", w.WCHAR * 128), ("dwState", w.DWORD), ("dwStateMask", w.DWORD),
+                ("szInfo", w.WCHAR * 256), ("uVersion", w.UINT), ("szInfoTitle", w.WCHAR * 64), ("dwInfoFlags", w.DWORD),
+                ("guidItem", ctypes.c_ubyte * 16), ("hBalloonIcon", w.HICON)]
+
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [("style", w.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", w.HINSTANCE), ("hIcon", w.HICON), ("hCursor", w.HANDLE), ("hbrBackground", w.HBRUSH),
+                ("lpszMenuName", w.LPCWSTR), ("lpszClassName", w.LPCWSTR)]
+
+
+user32, kernel32, shell32 = ctypes.WinDLL("user32"), ctypes.WinDLL("kernel32"), ctypes.WinDLL("shell32")
+user32.RegisterHotKey.argtypes = [w.HWND, ctypes.c_int, w.UINT, w.UINT]
+user32.UnregisterHotKey.argtypes = [w.HWND, ctypes.c_int]
+user32.GetMessageW.argtypes = [ctypes.POINTER(w.MSG), w.HWND, w.UINT, w.UINT]
+user32.TranslateMessage.argtypes = user32.DispatchMessageW.argtypes = [ctypes.POINTER(w.MSG)]
+user32.PostThreadMessageW.argtypes = [w.DWORD, w.UINT, w.WPARAM, w.LPARAM]
+user32.PostMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
+user32.GetAsyncKeyState.argtypes, user32.GetAsyncKeyState.restype = [ctypes.c_int], ctypes.c_short
+user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+user32.CreateWindowExW.argtypes = [w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, w.HWND, w.HMENU, w.HINSTANCE, ctypes.c_void_p]
+user32.CreateWindowExW.restype = w.HWND
+user32.DefWindowProcW.argtypes, user32.DefWindowProcW.restype = [w.HWND, w.UINT, w.WPARAM, w.LPARAM], ctypes.c_ssize_t
+user32.DestroyWindow.argtypes = [w.HWND]
+user32.FindWindowW.argtypes, user32.FindWindowW.restype = [w.LPCWSTR, w.LPCWSTR], w.HWND
+user32.RegisterWindowMessageW.argtypes = [w.LPCWSTR]
+user32.CreatePopupMenu.restype = w.HMENU
+user32.AppendMenuW.argtypes = [w.HMENU, w.UINT, ctypes.c_size_t, w.LPCWSTR]
+user32.TrackPopupMenu.argtypes = [w.HMENU, w.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, w.HWND, ctypes.c_void_p]
+user32.DestroyMenu.argtypes = [w.HMENU]
+user32.SetForegroundWindow.argtypes = [w.HWND]
+user32.GetCursorPos.argtypes = [ctypes.POINTER(w.POINT)]
+user32.CreateIconFromResourceEx.argtypes = [ctypes.c_char_p, w.DWORD, w.BOOL, w.DWORD, ctypes.c_int, ctypes.c_int, w.UINT]
+user32.CreateIconFromResourceEx.restype = w.HICON
+user32.DestroyIcon.argtypes = [w.HICON]
+kernel32.GetModuleHandleW.argtypes, kernel32.GetModuleHandleW.restype = [w.LPCWSTR], w.HMODULE
+shell32.Shell_NotifyIconW.argtypes = [w.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+
+
+class Hotkeys(threading.Thread):
+    """System-wide keybinds (RegisterHotKey), so they work while a game or Discord has the focus. Windows delivers them
+    to this thread's own message queue; each press goes on `pressed` for the window to act on."""
+
+    def __init__(self, bindings: dict[str, list], pressed: queue.Queue):
         super().__init__(daemon=True)
-        self.shared, self.devs, self.running, self.error, self.warning = shared, (mic, out, music), True, "", ""
+        self.bindings, self.pressed, self.taken, self.tid = bindings, pressed, set(), 0
+        self.ready = threading.Event()
         self.start()
+        self.ready.wait(2)
 
     def run(self) -> None:
-        mic = out = music = None
-        try:
-            if self.devs[2] == self.devs[1]:
-                raise OSError("Music from is the device you send to, so the mix would loop into itself. If the "
-                              "cable became your Windows default output, set your headphones back as the default.")
-            if devices("waveIn")[self.devs[0]].upper().startswith("CABLE"):
-                raise OSError("Microphone is the cable, so the mix would loop into itself. If the cable became your "
-                              "Windows default mic, set your real mic back as the default, or pick it here.")
-            mic = Mic(self.devs[0])
-            out = Speaker(self.devs[1])
-            try:
-                music = None if self.devs[2] is None else Loopback(self.devs[2])
-            except OSError as e:  # no music is no reason to cut the voice
-                self.warning = f"Live: your mic only. {e}."
-            stalls = 0
-            while self.running:
-                voice = mic.read()
-                if voice is None:
-                    stalls += 1
-                    if stalls == 4:  # 2 s of nothing from a mic that sends every 20 ms
-                        raise OSError("The microphone stopped sending sound (unplugged?). Plug it back in, then "
-                                      "pick it again.")
-                    continue
-                stalls = 0
-                try:
-                    tune = music.block() if music else SILENCE
-                except OSError:
-                    music.close()
-                    music, tune = None, SILENCE
-                    self.warning = ("Live: your mic only. The music stopped (app closed or device unplugged): pick "
-                                    "it again under Music from.")
-                sent = mix(voice, tune, *self.shared.gain)
-                out.write(sent)
-                level = array("h", sent)
-                self.shared.peak = max(self.shared.peak, max(level), -min(level))
-        except Exception as e:  # a thread's error would vanish under pythonw: the window shows it instead
-            self.error = str(e) or type(e).__name__
-        finally:
-            for dev in (music, out, mic):
-                if dev:
-                    dev.close()
+        self.tid = kernel32.GetCurrentThreadId()
+        actions = list(self.bindings)
+        for i, action in enumerate(actions, 1):
+            mods, vk = self.bindings[action][:2]
+            if not user32.RegisterHotKey(None, i, mods | MOD_NOREPEAT, vk):
+                self.taken.add(action)  # another app holds that key
+        self.ready.set()
+        msg = w.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == WM_HOTKEY and 0 < msg.wParam <= len(actions):
+                self.pressed.put(actions[msg.wParam - 1])
+        for i in range(1, len(actions) + 1):
+            user32.UnregisterHotKey(None, i)
+
+    def stop(self) -> None:
+        user32.PostThreadMessageW(self.tid, WM_QUIT, 0, 0)
+        self.join(1)
+
+
+class Tray(threading.Thread):
+    """MicMix's icon in the notification area: click it for the window, right-click for quick actions. Like Hotkeys,
+    it runs its own Windows message loop (behind a hidden window) and hands each command over through `pressed`."""
+
+    def __init__(self, pressed: queue.Queue, shared, color: str):
+        super().__init__(daemon=True)
+        self.pressed, self.shared, self.color, self.added = pressed, shared, color, False
+        self.ready = threading.Event()
+        self.start()
+        self.ready.wait(3)
+
+    def run(self) -> None:
+        self.proc = WNDPROC(self.handle)  # kept here: Windows calls it as long as the window lives
+        self.explorer_restarted = user32.RegisterWindowMessageW("TaskbarCreated")  # before the window: it gets messages
+        module = kernel32.GetModuleHandleW(None)                                    # while it is being created
+        user32.RegisterClassW(ctypes.byref(WNDCLASSW(lpfnWndProc=self.proc, hInstance=module,
+                                                     lpszClassName=TRAY_CLASS)))
+        self.hwnd = user32.CreateWindowExW(0, TRAY_CLASS, "MicMix", 0, 0, 0, 0, 0, None, None, module, None)
+        size = user32.GetSystemMetrics(49)  # SM_CXSMICON, already scaled for this display
+        png = icon(size, self.color)[22:]
+        self.icon = user32.CreateIconFromResourceEx(png, len(png), True, 0x30000, size, size, 0)
+        self.data = NOTIFYICONDATAW(cbSize=ctypes.sizeof(NOTIFYICONDATAW), hWnd=self.hwnd, uID=1,
+                                    uFlags=NIF_MESSAGE | NIF_ICON | NIF_TIP, uCallbackMessage=WM_TRAY,
+                                    hIcon=self.icon, szTip="MicMix")
+        self.added = bool(shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self.data)))
+        self.ready.set()
+        msg = w.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self.data))
+        user32.DestroyWindow(self.hwnd)
+        user32.DestroyIcon(self.icon)
+
+    def handle(self, hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+        if msg == WM_TRAY and lparam == WM_LBUTTONUP or msg == WM_SHOW:  # a click, or MicMix started a second time
+            self.pressed.put("show")
+        elif msg == WM_CLOSE:  # the installer, before it updates or removes MicMix: quit for real, saving settings
+            self.pressed.put("quit")
+        elif msg == WM_TRAY and lparam == WM_RBUTTONUP:
+            self.menu()
+        elif msg == self.explorer_restarted:  # Explorer restarted and lost its icons: add ours back
+            self.data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+            shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self.data))
+        else:
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+        return 0
+
+    def menu(self) -> None:
+        menu = user32.CreatePopupMenu()
+        for cmd, text in ((1, "Open MicMix"), (2, "Mute mic"), (3, "Stop sounds"), (0, None), (4, "Quit MicMix")):
+            user32.AppendMenuW(menu, MF_SEPARATOR if not cmd else MF_CHECKED if cmd == 2 and self.shared.muted else 0,
+                               cmd, text)
+        at = w.POINT()
+        user32.GetCursorPos(ctypes.byref(at))
+        user32.SetForegroundWindow(self.hwnd)  # or the menu wouldn't close when you click elsewhere
+        cmd = user32.TrackPopupMenu(menu, TPM_RETURNCMD, at.x, at.y, 0, self.hwnd, None)
+        user32.PostMessageW(self.hwnd, 0, 0, 0)  # WM_NULL, as Windows asks after a tray menu
+        user32.DestroyMenu(menu)
+        if cmd:
+            self.pressed.put({1: "show", 2: "mute", 3: "stop", 4: "quit"}[cmd])
+
+    def notify(self, title: str, text: str) -> None:
+        """A one-off notification from the icon."""
+        self.data.uFlags, self.data.szInfoTitle, self.data.szInfo, self.data.dwInfoFlags = NIF_INFO, title, text, 1
+        shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.data))
+
+    def stop(self) -> None:
+        user32.PostMessageW(self.hwnd, WM_QUIT, 0, 0)
+        self.join(1)
+
+
+def key_name(event: tk.Event) -> str:
+    name = event.keysym.replace("KP_", "Num ").replace("Prior", "PageUp").replace("Next", "PageDown")
+    return name[:1].upper() + name[1:]
 
 
 def load() -> dict:
@@ -497,8 +202,25 @@ def load() -> dict:
     return {}
 
 
-import tkinter.font as tkfont  # noqa: E402  (the window's look from here down; the sound above needs neither)
-import winreg  # noqa: E402
+def icon(size: int, color: str) -> bytes:
+    """MicMix's icon (the window's: a ring around a dot, in color) as an .ico file holding one PNG."""
+    rgb, c = bytes(int(color[i:i + 2], 16) for i in (1, 3, 5)), size / 2
+    cover = lambda r, d: min(1.0, max(0.0, r - d + 0.5))  # noqa: E731  (anti-aliased edge)
+    rows = b""
+    for y in range(size):
+        row = bytearray(b"\0")  # PNG filter: none
+        for x in range(size):
+            d = math.hypot(x + 0.5 - c, y + 0.5 - c)
+            alpha = cover(c, d) - cover(c * 11 / 16, d) + cover(c * 6 / 16, d)
+            row += rgb + bytes((round(255 * alpha),))
+        rows += row
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(rows, 9)) + chunk(b"IEND", b""))
+    return struct.pack("<HHHBBBBHHII", 0, 1, 1, size % 256, size % 256, 0, 0, 1, 32, len(png), 22) + png
+
 
 # Windows 11 dark (Fluent): layered greys and one accent, the user's Windows accent color
 WINDOW, CARD, STROKE, FIELD, HOVER, RAIL = "#202020", "#2b2b2b", "#3a3a3a", "#373737", "#3f3f3f", "#5c5c5c"
@@ -554,6 +276,39 @@ def card(parent: tk.Misc, pad: int = 0) -> tk.Frame:
     return body
 
 
+def scroller(parent: tk.Misc, most: int) -> tuple[tk.Frame, tk.Frame]:
+    """(outer, inner): place outer, fill inner. inner scrolls (wheel or bar) once it is taller than `most` pixels."""
+    outer = tk.Frame(parent, bg=CARD)
+    view = tk.Canvas(outer, bg=CARD, highlightthickness=0, width=1, height=1)
+    bar = ttk.Scrollbar(outer, command=view.yview)
+    view.configure(yscrollcommand=bar.set)
+    view.pack(side="left", fill="both", expand=True)
+    inner = tk.Frame(view, bg=CARD)
+    item = view.create_window(0, 0, window=inner, anchor="nw")
+
+    def fit(_=None) -> None:
+        tall = inner.winfo_reqheight()
+        view.configure(height=min(tall, most), scrollregion=(0, 0, 0, tall))
+        if tall > most:
+            bar.pack(side="right", fill="y")
+        else:
+            bar.pack_forget()
+        view.itemconfigure(item, width=view.winfo_width())
+    inner.bind("<Configure>", fit)
+    view.bind("<Configure>", fit)
+    wheel = lambda e: view.yview_scroll(-e.delta // 120, "units")  # noqa: E731
+    outer.bind("<Enter>", lambda e: outer.bind_all("<MouseWheel>", wheel))
+    outer.bind("<Leave>", lambda e: outer.unbind_all("<MouseWheel>"))
+    return outer, inner
+
+
+def dark_titlebar(win: tk.Misc) -> None:
+    win.update_idletasks()
+    with contextlib.suppress(AttributeError, OSError):  # this window only
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(1)), 4)
+
+
 def theme(root: tk.Tk) -> str:
     """Windows 11 dark, in clam (the native "vista" theme ignores colors). Returns the accent color."""
     global K
@@ -578,6 +333,15 @@ def theme(root: tk.Tk) -> str:
     s.configure("TCombobox", arrowcolor=TEXT2, arrowsize=px(9), padding=px(9, 5, 4, 5))
     s.map("TCombobox", bordercolor=[("focus", lit)], **dict.fromkeys(
         ("fieldbackground", "background", "lightcolor", "darkcolor", "selectbackground"), [("hover", HOVER), ("", FIELD)]))
+    s.configure("TButton", background=FIELD, foreground=TEXT, bordercolor=STROKE, lightcolor=FIELD, darkcolor=FIELD,
+                focuscolor=FIELD, padding=px(12, 6), font=(text, 10))
+    s.map("TButton", background=[("pressed", RAIL), ("active", HOVER)], lightcolor=[("active", HOVER)],
+          darkcolor=[("active", HOVER)], bordercolor=[("focus", lit)])
+    s.configure("Sound.TButton", padding=px(10, 10), font=(strong, 10), wraplength=px(120), justify="center")
+    s.configure("TCheckbutton", indicatorbackground=FIELD, indicatorforeground=lit, upperbordercolor=RAIL,
+                lowerbordercolor=RAIL, focuscolor=CARD, indicatorsize=px(15), indicatormargin=px(0, 0, 8, 0))
+    s.map("TCheckbutton", background=[("active", CARD)], indicatorbackground=[("selected", lit), ("active", HOVER)],
+          indicatorforeground=[("selected", TEXT)])  # ticked: an accent box, as Windows 11 draws it
     size, rail = px(20), tk.PhotoImage(width=2, height=px(20))  # Fluent's slider: a grey rail, a ringed accent thumb
     rail.put(CARD, to=(0, 0, 2, size))
     rail.put(RAIL, to=(0, (size - px(4)) // 2, 2, (size + px(4)) // 2))
@@ -588,10 +352,7 @@ def theme(root: tk.Tk) -> str:
     s.layout("Fluent.Horizontal.TScale", [("Fluent.trough", {"sticky": "ew", "children": [
         ("Fluent.slider", {"side": "left", "sticky": ""})]})])
     root.iconphoto(True, root.images[-1])
-    root.update_idletasks()
-    with contextlib.suppress(AttributeError, OSError):  # a dark title bar, this window only
-        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(1)), 4)
+    dark_titlebar(root)
     return lit
 
 
@@ -601,28 +362,31 @@ class App(tk.Tk):
             ctypes.windll.shcore.SetProcessDpiAwareness(1)  # sharp text on scaled displays
         super().__init__()
         self.title("MicMix")
-        lit = theme(self)
+        self.lit = theme(self)
         self.configure(padx=px(20), pady=px(16))
         self.minsize(px(420), 0)
         saved = load()
-        self.shared = SimpleNamespace(gain=(1.0, 0.0), peak=0)
-        self.engine = None
+        self.shared, self.engine, self.hotkeys, self.dialog = audio.shared_state(), None, None, None
+        self.keys: dict[str, list] = saved.get("keys", {})
+        self.pressed, self.cache, self.key_labels, self.note = queue.Queue(), {}, {}, ("", 0.0)
+        self.last_fade, self.tray_tip, self.closed = 0.25, bool(saved.get("tray_tip")), False
+        self.tray = Tray(self.pressed, self.shared, self.lit)
 
         ttk.Label(self, text="MicMix", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(self, text="Your mic and your music, together in one mic", style="Note.TLabel").pack(
+        ttk.Label(self, text="Your mic, your music and your sounds, together in one mic", style="Note.TLabel").pack(
             anchor="w", pady=(0, px(14)))
         grid = card(self)
         grid.columnconfigure(2, weight=1)
-        cable = next((d for d in devices("waveOut") if d.upper().startswith("CABLE") and "16CH" not in d.upper()), "")
-        mics = lambda: [DEFAULT, *(d for d in devices("waveIn") if not d.upper().startswith("CABLE"))]  # no loops
-        sources = lambda: [OFF, *playing_apps(), DEFAULT, *devices("waveOut")]  # one app, or all of a device
+        cable = next((d for d in audio.devices("waveOut") if audio.is_cable(d) and "16CH" not in d.upper()), "")
+        mics = lambda: [DEFAULT, *(d for d in audio.devices("waveIn") if not audio.is_cable(d))]  # no loops
+        sources = lambda: [OFF, *audio.playing_apps(), DEFAULT, *audio.devices("waveOut")]  # one app, or a device
         self.mic = self.picker(grid, 0, "Microphone", mics, saved.get("mic"), DEFAULT)
         self.music = self.picker(grid, 1, "Music from", sources, saved.get("music"), OFF)
-        self.out = self.picker(grid, 2, "Send to", lambda: devices("waveOut"), saved.get("out"), cable)
+        self.out = self.picker(grid, 2, "Send to", lambda: audio.devices("waveOut"), saved.get("out"), cable)
 
         fader = card(self, px(16))
         fader.columnconfigure(2, weight=1)
-        for row, col, name in ((0, 0, "Voice"), (0, 3, "Music"), (2, 0, "Level")):
+        for row, col, name in ((0, 0, "Voice"), (0, 3, "Music"), (2, 0, "Level"), (3, 0, "Noise gate")):
             ttk.Label(fader, text=name, style="Dim.TLabel").grid(row=row, column=col, sticky="w", padx=(0, px(6)),
                                                                  pady=px(4))
         self.levels = [ttk.Label(fader, style="Value.TLabel", width=4) for _ in range(2)]  # voice %, music %
@@ -631,23 +395,78 @@ class App(tk.Tk):
         self.fade = tk.DoubleVar(value=float(saved.get("fade", 0.25)))
         ttk.Scale(fader, from_=0, to=1, variable=self.fade, command=self.set_fade,
                   style="Fluent.Horizontal.TScale").grid(row=1, column=0, columnspan=5, sticky="ew", pady=px(4, 6))
-        self.meter = tk.Canvas(fader, width=1, height=px(4), bg=CARD, highlightthickness=0)
-        self.meter.grid(row=2, column=1, columnspan=4, sticky="ew")
-        for tag, color in (("rail", STROKE), ("level", lit)):
-            self.meter.create_line(0, 0, 0, 0, width=px(4), capstyle="round", fill=color, tags=tag)
+        self.meter = self.bar(fader, row=2, column=1, columnspan=4)
+        self.gate_label = ttk.Label(fader, style="Value.TLabel", width=6)
+        self.gate_label.grid(row=3, column=1, sticky="w")
+        switches = tk.Frame(fader, bg=CARD)
+        switches.grid(row=7, column=0, columnspan=5, sticky="w", pady=px(4, 10))
+        self.isolate, self.muted = tk.BooleanVar(value=bool(saved.get("isolate"))), tk.BooleanVar(value=False)
+        ttk.Checkbutton(switches, text="Voice isolation (Windows' noise removal, where your PC has it)",
+                        variable=self.isolate, command=self.restart).pack(side="left", padx=(0, px(20)))
+        ttk.Checkbutton(switches, text="Mute mic", variable=self.muted, command=self.set_mute).pack(side="left")
+        self.gate = tk.DoubleVar(value=float(saved.get("gate", GATE_OFF)))
+        ttk.Scale(fader, from_=GATE_OFF, to=0, variable=self.gate, command=self.set_gate,
+                  style="Fluent.Horizontal.TScale").grid(row=4, column=0, columnspan=5, sticky="ew", pady=px(2, 0))
+        self.mic_meter = self.bar(fader, row=5, column=0, columnspan=5, inset=px(10))  # under the gate's thumb
+        ttk.Label(fader, text="Drag the gate just above your mic's level when you're quiet.", style="Dim.TLabel").grid(
+            row=6, column=0, columnspan=5, sticky="w", pady=px(4, 2))
+
+        board = card(self, px(16))
+        board.columnconfigure(1, weight=1)
+        ttk.Label(board, text="Soundboard", style="Value.TLabel").grid(row=0, column=0, sticky="w", pady=px(6))
+        self.volume = tk.DoubleVar(value=float(saved.get("board", 0.7)))
+        ttk.Scale(board, from_=0, to=1, variable=self.volume, command=self.set_volume,
+                  style="Fluent.Horizontal.TScale").grid(row=0, column=1, sticky="ew", padx=px(12))
+        self.volume_label = ttk.Label(board, style="Value.TLabel", width=4)
+        self.volume_label.grid(row=0, column=2, sticky="w")
+        self.hear = tk.BooleanVar(value=bool(saved.get("hear", True)))
+        ttk.Checkbutton(board, text="Hear them too", variable=self.hear, command=self.restart).grid(
+            row=0, column=3, sticky="e", padx=(px(12), 0))
+        pad_box, self.pads = scroller(board, px(270))  # about four rows of pads, then it scrolls
+        pad_box.grid(row=1, column=0, columnspan=4, sticky="ew", pady=px(4))
+        tools = tk.Frame(board, bg=CARD)
+        tools.grid(row=2, column=0, columnspan=4, sticky="ew", pady=px(6, 10))
+        for text, command in (("Add sounds…", self.add_sounds), ("Open folder", self.open_folder),
+                              ("Stop sounds", lambda: self.shared.clips.put(audio.STOP)), ("Keybinds…", self.keybinds)):
+            ttk.Button(tools, text=text, command=command).pack(side="left", padx=(0, px(6)))
+
         self.status = ttk.Label(self, style="Note.TLabel", foreground=TEXT2)
         self.status.pack(fill="x", padx=px(2), pady=(px(6), 0))
         self.status.bind("<Configure>", lambda e: self.status.configure(wraplength=e.width))  # wrap at window width
 
-        self.protocol("WM_DELETE_WINDOW", self.close)
+        SOUNDS.mkdir(exist_ok=True)
+        self.shown_sounds: list[str] = []
+        self.bind("<Activate>", lambda e: e.widget is self and self.draw_pads())  # files dropped in the folder
+        self.protocol("WM_DELETE_WINDOW", self.hide)
+        self.protocol("WM_SAVE_YOURSELF", self.save)  # Tk's word for Windows signing out or shutting down
+        self.draw_pads()
         self.set_fade()
+        self.set_gate()
+        self.set_volume()
+        self.rebind()
         self.restart()
         self.poll()
+
+    def bar(self, parent: tk.Frame, inset: int = 0, **grid) -> tk.Canvas:
+        """A slim pill meter (rail + level), drawn in poll(). inset keeps its ends under a slider thumb's travel."""
+        meter = tk.Canvas(parent, width=1, height=px(4), bg=CARD, highlightthickness=0)
+        meter.grid(sticky="ew", **grid)
+        meter.inset = inset
+        for tag, color in (("rail", STROKE), ("level", self.lit)):
+            meter.create_line(0, 0, 0, 0, width=px(4), capstyle="round", fill=color, tags=tag)
+        return meter
+
+    @staticmethod
+    def show(meter: tk.Canvas, fraction: float, color: str) -> None:
+        r, w = meter.winfo_height() / 2 + meter.inset, meter.winfo_width()  # a pill: round caps, r from each end
+        meter.coords("rail", r, r - meter.inset, w - r, r - meter.inset)
+        meter.coords("level", r, r - meter.inset, r + (w - 2 * r) * max(0.0, min(1.0, fraction)), r - meter.inset)
+        meter.itemconfigure("level", fill=color)
 
     def picker(self, grid: tk.Frame, row: int, label: str, names, saved: str | None, fallback: str) -> tk.StringVar:
         """A dropdown. Its list is read again each time it opens, so a device plugged in or an app started later shows
         up. A picked app stays picked while it isn't playing."""
-        var = tk.StringVar(value=saved if saved in names() or is_app(str(saved)) else fallback)
+        var = tk.StringVar(value=saved if saved in names() or audio.is_app(str(saved)) else fallback)
         if row:  # a hairline between rows, edge to edge
             tk.Frame(grid, height=1, bg=WINDOW).grid(row=2 * row - 1, column=0, columnspan=3, sticky="ew")
         ttk.Label(grid, text=ICONS.get(label, ""), style="Icon.TLabel").grid(row=2 * row, column=0, padx=(px(16), 0))
@@ -661,16 +480,17 @@ class App(tk.Tk):
     def restart(self, *_) -> None:
         """Open the picked devices (after closing the old ones). Without a Send to there is nothing to run."""
         self.stop()
-        mic = device_id("waveIn", self.mic.get())
-        if mic in (None, WAVE_MAPPER):  # default, or gone: use a real id, so a cable that became the default is caught
-            mic = default_device("waveIn")
-        out = device_id("waveOut", self.out.get())
+        mic = audio.device_id("waveIn", self.mic.get())
+        if mic in (None, audio.WAVE_MAPPER):  # default, or gone: use a real id, so a cable that became the default is caught
+            mic = audio.default_device("waveIn")
+        out = audio.device_id("waveOut", self.out.get())
         music = self.music.get()
-        if not is_app(music):  # a whole device, or Off
-            music = device_id("waveOut", music)
-            if music == WAVE_MAPPER:
-                music = default_device("waveOut")  # loopback needs a real device, also checked against Send to
-        self.engine = None if out is None else Engine(self.shared, mic, out, music)
+        if not audio.is_app(music):  # a whole device, or Off
+            music = audio.device_id("waveOut", music)
+            if music == audio.WAVE_MAPPER:
+                music = audio.default_device("waveOut")  # loopback needs a real device, also checked against Send to
+        monitor = audio.default_device("waveOut") if self.hear.get() else None
+        self.engine = None if out is None else audio.Engine(self.shared, mic, out, music, monitor, self.isolate.get())
         self.save()
 
     def stop(self) -> None:
@@ -679,50 +499,273 @@ class App(tk.Tk):
             self.engine.join(1)
 
     def set_fade(self, *_) -> None:
-        voice, music = gains(self.fade.get())
+        voice, music = audio.gains(self.fade.get())
         self.shared.gain = voice, music
         for label, gain in zip(self.levels, (voice, music)):
             label.configure(text=f"{gain:.0%}")
 
+    def set_gate(self, *_) -> None:
+        on = self.gate.get() > GATE_OFF + 0.5
+        self.shared.gate = self.gate.get() if on else None
+        self.gate_label.configure(text=f"{self.gate.get():.0f} dB" if on else "Off")
+
+    def set_volume(self, *_) -> None:
+        self.shared.board = self.volume.get() ** 2  # squared, as the music: even steps to the ear
+        self.volume_label.configure(text=f"{self.volume.get():.0%}")
+
+    def set_mute(self) -> None:
+        self.shared.muted = self.muted.get()
+
+    def sound_names(self) -> list[str]:
+        return sorted((p.name for p in SOUNDS.iterdir() if p.suffix.lower() in SOUND_TYPES), key=str.lower)
+
+    def draw_pads(self, force: bool = False) -> None:
+        names = self.sound_names()
+        if names == self.shown_sounds and not force and self.pads.winfo_children():
+            return
+        self.shown_sounds = names
+        for gone in set(self.cache) - set(names):  # deleted or renamed: free its memory
+            del self.cache[gone]
+        for child in self.pads.winfo_children():
+            child.destroy()
+        if not names:
+            ttk.Label(self.pads, text="Add MP3, WAV or M4A files to play them into your mic.", style="Dim.TLabel").grid(
+                row=0, column=0, sticky="w", pady=px(4))
+        for i, name in enumerate(names):
+            key = self.keys.get(f"sound:{name}")
+            pad = ttk.Button(self.pads, text=Path(name).stem + (f"\n{key[2]}" if key else ""), style="Sound.TButton",
+                             command=lambda n=name: self.play(n))
+            pad.grid(row=i // 4, column=i % 4, sticky="nsew", padx=px(0, 6), pady=px(0, 6))
+        for col in range(4):
+            self.pads.columnconfigure(col, weight=1, uniform="pad")
+
+    def play(self, name: str) -> None:
+        """Into the mix (and your headphones). A sound is decoded once, on its own thread, then kept in memory until
+        its file changes."""
+        try:
+            info = (SOUNDS / name).stat()
+        except OSError:
+            self.note = (f"Can't play {Path(name).stem}: the file is gone.", time.monotonic() + 6)
+            return
+        stamp = info.st_mtime_ns, info.st_size  # a file replaced under the same name gets decoded again
+        if self.cache.get(name, (None,))[0] == stamp:
+            self.shared.clips.put(self.cache[name][1])
+            return
+
+        def load_and_play() -> None:
+            try:
+                pcm = audio.decode(str(SOUNDS / name))
+            except (OSError, MemoryError) as e:
+                self.note = (f"Can't play {Path(name).stem}: {e or 'not enough memory'}.", time.monotonic() + 6)
+                return
+            self.cache[name] = stamp, pcm
+            self.shared.clips.put(pcm)
+        threading.Thread(target=load_and_play, daemon=True).start()
+
+    def add_sounds(self) -> None:
+        types = [("Sounds", " ".join(f"*{t}" for t in sorted(SOUND_TYPES))), ("All files", "*.*")]
+        for path in filedialog.askopenfilenames(parent=self, title="Add sounds", filetypes=types):
+            with contextlib.suppress(OSError, shutil.SameFileError):
+                shutil.copy2(path, SOUNDS / Path(path).name)
+        self.draw_pads()
+
+    def open_folder(self) -> None:
+        os.startfile(SOUNDS)
+
+    def keybinds(self) -> None:
+        """A window listing every action and sound with its keys: click Set, then press the keys."""
+        if self.dialog and self.dialog.winfo_exists():
+            self.dialog.lift()
+            return
+        top = self.dialog = tk.Toplevel(self, bg=WINDOW, padx=px(20), pady=px(16))
+        top.title("MicMix keybinds")
+        top.transient(self)
+        ttk.Label(top, text="Keybinds", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(top, text="They work in any app, games included. Click Set, then press the keys (Esc cancels). Keys "
+                            "that type need Ctrl or Alt; F1-F24 and the number pad work alone.",
+                  style="Note.TLabel", wraplength=px(560)).pack(anchor="w", pady=(0, px(12)))
+        box, body = scroller(card(top, px(16)), px(440))
+        box.pack(fill="both", expand=True, pady=px(6))
+        body.columnconfigure(1, weight=1)
+        names = self.sound_names()
+        gone = [a[6:] for a in self.keys if a.startswith("sound:") and a[6:] not in names]  # still bound: clearable
+        rows = [*ACTIONS.items(), *((f"sound:{n}", f"Play {Path(n).stem}") for n in names),
+                *((f"sound:{n}", f"Play {Path(n).stem} (file gone)") for n in gone)]
+        top.bind("<Destroy>", lambda e: e.widget is top and not self.hotkeys and self.rebind())  # closed mid-capture
+        self.key_labels = {}
+        for r, (action, label) in enumerate(rows):
+            ttk.Label(body, text=label).grid(row=r, column=0, sticky="w", pady=px(3), padx=(0, px(16)))
+            shown = ttk.Label(body, style="Dim.TLabel", width=24)
+            shown.grid(row=r, column=1, sticky="w")
+            ttk.Button(body, text="Set", command=lambda a=action: self.capture(a)).grid(row=r, column=2, padx=px(6),
+                                                                                       pady=px(3))
+            ttk.Button(body, text="Clear", command=lambda a=action: self.bind_key(a, None)).grid(row=r, column=3)
+            self.key_labels[action] = shown
+        self.show_keys()
+        dark_titlebar(top)
+
+    def capture(self, action: str) -> None:
+        if self.hotkeys:  # let go of MicMix's own keys meanwhile, or pressing one would run it instead of moving it
+            self.hotkeys.stop()
+            self.hotkeys = None
+        self.key_labels[action].configure(text="Press the keys…", foreground=self.lit)
+        self.dialog.focus_force()
+
+        def pressed(event: tk.Event) -> None:
+            if event.keycode in (0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5):
+                return  # a modifier on its own: wait for the key
+            if event.keysym == "Escape":
+                self.dialog.unbind("<KeyPress>")
+                self.rebind()
+                self.show_keys()
+                return
+            held = [m for m in MODIFIERS if user32.GetAsyncKeyState(m[0]) & 0x8000]
+            mods = sum({m[1] for m in held})
+            if not mods & 11 and not 0x60 <= event.keycode <= 0x87:  # 11: Ctrl, Alt or Win; 0x60-0x87: numpad, F-keys
+                self.key_labels[action].configure(text="Add Ctrl or Alt (that key types)", foreground=self.lit)
+                return  # a key that types would stop typing in every app: keep listening
+            self.dialog.unbind("<KeyPress>")
+            name = "+".join([*dict.fromkeys(m[2] for m in held), key_name(event)])
+            self.bind_key(action, [mods, event.keycode, name])
+        self.dialog.bind("<KeyPress>", pressed)
+
+    def bind_key(self, action: str, binding: list | None) -> None:
+        """One action per key: binding a key takes it from whatever had it."""
+        for other, keys in list(self.keys.items()):
+            if binding and keys[:2] == binding[:2]:
+                del self.keys[other]
+        self.keys.pop(action, None)
+        if binding:
+            self.keys[action] = binding
+        self.rebind()
+        self.save()
+        self.draw_pads(force=True)  # a pad shows its key
+        self.show_keys()
+
+    def show_keys(self) -> None:
+        taken = self.hotkeys.taken if self.hotkeys else set()
+        for action, shown in self.key_labels.items():
+            key = self.keys.get(action)
+            text = (key[2] + ("  (another app has it)" if action in taken else "")) if key else "None"
+            shown.configure(text=text, foreground=TEXT if key and action not in taken else TEXT3)
+
+    def rebind(self) -> None:
+        if self.hotkeys:
+            self.hotkeys.stop()
+        self.hotkeys = Hotkeys(dict(self.keys), self.pressed)
+
+    def act(self, action: str) -> None:
+        """What a keybind does."""
+        if action == "mute":
+            self.muted.set(not self.muted.get())
+            self.set_mute()
+        elif action == "music":  # off: voice only; on: back to where the slider was
+            if self.fade.get() > 0.01:
+                self.last_fade = self.fade.get()
+            self.fade.set(0 if self.fade.get() > 0.01 else self.last_fade)
+            self.set_fade()
+        elif action in ("up", "down"):  # music is full from the middle on: "up" stops there, or it'd take your voice
+            f = self.fade.get()
+            self.fade.set(min(max(f, 0.5), f + 0.05) if action == "up" else max(0.0, f - 0.05))
+            self.set_fade()
+        elif action == "stop":
+            self.shared.clips.put(audio.STOP)
+        elif action.startswith("sound:"):
+            self.play(action[6:])
+        elif action == "show":  # from the tray icon, or MicMix started again
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        elif action == "quit":
+            self.close()
+
     def poll(self) -> None:
-        level = max(0, 100 + 100 / 3 * math.log10(max(self.shared.peak, 1) / 32768))  # the top 60 dB
-        r, w = self.meter.winfo_height() / 2, self.meter.winfo_width()  # a pill: round caps, r from each end
-        self.meter.coords("rail", r, r, w - r, r)
-        self.meter.coords("level", r, r, r + (w - 2 * r) * level / 100, r)
-        self.shared.peak = 0
-        music = self.music.get()
+        with contextlib.suppress(queue.Empty):
+            while not self.closed:
+                self.act(self.pressed.get_nowait())
+        if self.closed:  # "quit" just closed the window
+            return
+        s, music = self.shared, self.music.get()
+        self.show(self.meter, 1 + audio.db(s.peak) / 60, self.lit)  # the top 60 dB
+        self.show(self.mic_meter, 1 - audio.db(s.mic_peak) / GATE_OFF, self.lit if s.gate_open else RAIL)
+        s.peak = s.mic_peak = 0
         if self.engine and self.engine.error:
             text = self.engine.error
         elif not self.engine:
-            text = "Pick Send to. For a virtual mic, install VB-Cable first (see README.md)."
+            text = "Pick Send to. For a virtual mic, install VB-CABLE first (see README.md)."
+        elif time.monotonic() < self.note[1]:
+            text = self.note[0]
         elif self.engine.warning:
             text = self.engine.warning
         elif music == OFF:
             text = "Live: your mic only. Pick the app your music plays in under Music from."
-        elif is_app(music):
+        elif audio.is_app(music):
             text = f"Live: your mic + {music}, nothing else."
         else:
             text = f"Live: your mic + everything playing on {music}."
+        if s.muted and self.engine and not self.engine.error:
+            text = "Mic muted. " + text
         self.status.configure(text=text)
-        self.after(100, self.poll)
+        self.after(50, self.poll)
 
     def save(self) -> None:
         data = {"mic": self.mic.get(), "music": self.music.get(), "out": self.out.get(),
-                "fade": round(self.fade.get(), 3)}
+                "fade": round(self.fade.get(), 3), "gate": round(self.gate.get(), 1),
+                "board": round(self.volume.get(), 3), "hear": self.hear.get(), "isolate": self.isolate.get(),
+                "keys": self.keys, "tray_tip": self.tray_tip}
         with contextlib.suppress(OSError):
             SETTINGS.write_text(json.dumps(data, indent=1), encoding="utf-8")
 
+    def hide(self) -> None:
+        """The close button: MicMix keeps your mic going from the notification area (when it has an icon there)."""
+        if not self.tray.added:
+            self.close()
+            return
+        self.withdraw()
+        if not self.tray_tip:  # said once (set before saving, so it stays said)
+            self.tray_tip = True
+            self.tray.notify("MicMix is still on", "Your mic keeps going. Click MicMix's icon by the clock (under ^ if "
+                                                   "Windows hid it) to open it; right-click it to quit.")
+        self.save()
+
     def close(self) -> None:
+        self.closed = True
         self.save()
         self.stop()
+        for thread in (self.hotkeys, self.tray):
+            if thread:
+                thread.stop()
         self.destroy()
 
 
-if __name__ == "__main__":
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.CreateMutexW.restype = w.HANDLE
-    running = k32.CreateMutexW(None, False, "Local\\MicMix")  # held until exit
-    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS: a second copy would send everything twice
-        ctypes.windll.user32.MessageBoxW(None, "MicMix is already open. Look for it on the taskbar.", "MicMix", 0x40)
+def main(args: list[str]) -> None:
+    """The window; or, for the installer: --save-defaults FILE / --restore-defaults FILE (Windows' default devices,
+    which VB-CABLE's setup changes) and --icon FILE (writes the shortcut icon)."""
+    if args[:1] == ["--save-defaults"]:
+        Path(args[1]).write_text(json.dumps(audio.defaults(), indent=1), encoding="utf-8")
+    elif args[:1] == ["--restore-defaults"]:  # exit code 1 if Windows refused any (a device that's gone)
+        sys.exit(1 if audio.set_defaults(json.loads(Path(args[1]).read_text(encoding="utf-8"))) else 0)
+    elif args[:1] == ["--icon"]:
+        Path(args[1]).write_bytes(icon(256, accent()))
     else:
-        App().mainloop()
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = w.HANDLE
+        running = k32.CreateMutexW(None, False, "Local\\MicMix")  # noqa: F841  (held until exit)
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS: a second copy would send everything twice
+            tray = user32.FindWindowW(TRAY_CLASS, None)
+            if tray:  # bring the running one's window up instead (it may be hidden in the tray)
+                user32.AllowSetForegroundWindow(-1)  # ASFW_ANY: hand it this start's right to come to the front
+                user32.PostMessageW(tray, WM_SHOW, 0, 0)
+            else:
+                user32.MessageBoxW(None, "MicMix is already open. Look for it on the taskbar.", "MicMix", 0x40)
+        else:
+            shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)  # its own taskbar button, not Python's
+            try:
+                App().mainloop()
+            except Exception:  # under pythonw a start-up error would vanish without a trace
+                import traceback
+                user32.MessageBoxW(None, traceback.format_exc()[-1500:], "MicMix couldn't start", 0x10)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

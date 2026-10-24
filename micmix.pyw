@@ -17,14 +17,11 @@ import math
 import os
 import queue
 import shutil
-import struct
 import sys
 import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-import winreg
-import zlib
 from ctypes import wintypes as w
 from pathlib import Path
 from tkinter import filedialog, ttk
@@ -81,8 +78,9 @@ user32.TrackPopupMenu.argtypes = [w.HMENU, w.UINT, ctypes.c_int, ctypes.c_int, c
 user32.DestroyMenu.argtypes = [w.HMENU]
 user32.SetForegroundWindow.argtypes = [w.HWND]
 user32.GetCursorPos.argtypes = [ctypes.POINTER(w.POINT)]
-user32.CreateIconFromResourceEx.argtypes = [ctypes.c_char_p, w.DWORD, w.BOOL, w.DWORD, ctypes.c_int, ctypes.c_int, w.UINT]
-user32.CreateIconFromResourceEx.restype = w.HICON
+user32.LoadImageW.argtypes = [w.HINSTANCE, w.LPCWSTR, w.UINT, ctypes.c_int, ctypes.c_int, w.UINT]
+user32.LoadImageW.restype = w.HANDLE
+user32.SystemParametersInfoW.argtypes = [w.UINT, w.UINT, ctypes.c_void_p, w.UINT]
 user32.DestroyIcon.argtypes = [w.HICON]
 kernel32.GetModuleHandleW.argtypes, kernel32.GetModuleHandleW.restype = [w.LPCWSTR], w.HMODULE
 shell32.Shell_NotifyIconW.argtypes = [w.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
@@ -138,8 +136,7 @@ class Tray(threading.Thread):
                                                      lpszClassName=TRAY_CLASS)))
         self.hwnd = user32.CreateWindowExW(0, TRAY_CLASS, "MicMix", 0, 0, 0, 0, 0, None, None, module, None)
         size = user32.GetSystemMetrics(49)  # SM_CXSMICON, already scaled for this display
-        png = icon(size, self.color)[22:]
-        self.icon = user32.CreateIconFromResourceEx(png, len(png), True, 0x30000, size, size, 0)
+        self.icon = user32.LoadImageW(None, str(ASSETS / "micmix.ico"), 1, size, size, 0x10)  # the SD mark
         self.data = NOTIFYICONDATAW(cbSize=ctypes.sizeof(NOTIFYICONDATAW), hWnd=self.hwnd, uID=1,
                                     uFlags=NIF_MESSAGE | NIF_ICON | NIF_TIP, uCallbackMessage=WM_TRAY,
                                     hIcon=self.icon, szTip="MicMix")
@@ -154,7 +151,10 @@ class Tray(threading.Thread):
         user32.DestroyIcon(self.icon)
 
     def handle(self, hwnd: int, msg: int, wparam: int, lparam: int) -> int:
-        if msg == WM_TRAY and lparam == WM_LBUTTONUP or msg == WM_SHOW:  # a click, or MicMix started a second time
+        if msg == WM_TRAY and lparam == WM_LBUTTONUP:  # a click: the pop-up panel by the clock
+            user32.SetForegroundWindow(self.hwnd)  # MicMix may take the focus now, so the panel can close on click-away
+            self.pressed.put("flyout")
+        elif msg == WM_SHOW:  # MicMix started a second time: the full window
             self.pressed.put("show")
         elif msg == WM_CLOSE:  # the installer, before it updates or removes MicMix: quit for real, saving settings
             self.pressed.put("quit")
@@ -202,29 +202,10 @@ def load() -> dict:
     return {}
 
 
-def icon(size: int, color: str) -> bytes:
-    """MicMix's icon (the window's: a ring around a dot, in color) as an .ico file holding one PNG."""
-    rgb, c = bytes(int(color[i:i + 2], 16) for i in (1, 3, 5)), size / 2
-    cover = lambda r, d: min(1.0, max(0.0, r - d + 0.5))  # noqa: E731  (anti-aliased edge)
-    rows = b""
-    for y in range(size):
-        row = bytearray(b"\0")  # PNG filter: none
-        for x in range(size):
-            d = math.hypot(x + 0.5 - c, y + 0.5 - c)
-            alpha = cover(c, d) - cover(c * 11 / 16, d) + cover(c * 6 / 16, d)
-            row += rgb + bytes((round(255 * alpha),))
-        rows += row
-
-    def chunk(kind: bytes, data: bytes) -> bytes:
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
-    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
-           + chunk(b"IDAT", zlib.compress(rows, 9)) + chunk(b"IEND", b""))
-    return struct.pack("<HHHBBBBHHII", 0, 1, 1, size % 256, size % 256, 0, 0, 1, 32, len(png), 22) + png
-
-
-# Windows 11 dark (Fluent): layered greys and one accent, the user's Windows accent color
-WINDOW, CARD, STROKE, FIELD, HOVER, RAIL = "#202020", "#2b2b2b", "#3a3a3a", "#373737", "#3f3f3f", "#5c5c5c"
-TEXT, TEXT2, TEXT3 = "#ffffff", "#cfcfcf", "#9d9d9d"
+# SILVADES: neon #39FF14 on near-black #050505, Oxanium 700 headings, IBM Plex Mono labels (assets\fonts, OFL)
+WINDOW, CARD, STROKE, FIELD, HOVER, RAIL = "#050505", "#121212", "#222222", "#1a1a1a", "#262626", "#333333"
+TEXT, TEXT2, TEXT3, NEON = "#e0e0e0", "#9a9a9a", "#777777", "#39ff14"
+ASSETS = HERE / "assets"
 ICONS = {"Microphone": "", "Music from": "", "Send to": ""}  # Segoe Fluent Icons / MDL2 Assets
 K = 1.0  # screen pixels per 96-DPI pixel, set by theme(); fonts are in points and scale by themselves
 
@@ -232,15 +213,6 @@ K = 1.0  # screen pixels per 96-DPI pixel, set by theme(); fonts are in points a
 def px(*n: float):
     r = [round(x * K) for x in n]
     return r[0] if len(r) == 1 else tuple(r)
-
-
-def accent() -> str:
-    """The Windows accent color (Settings > Personalization > Colors), which DWM keeps as 0xAABBGGRR."""
-    with contextlib.suppress(OSError, TypeError):
-        abgr = winreg.QueryValueEx(winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM"),
-                                   "AccentColor")[0]
-        return f"#{abgr & 255:02x}{abgr >> 8 & 255:02x}{abgr >> 16 & 255:02x}"
-    return "#4cc2ff"
 
 
 def disc(size: int, rings: list[tuple[float, str]], bg: str = CARD) -> tk.PhotoImage:
@@ -310,26 +282,33 @@ def dark_titlebar(win: tk.Misc) -> None:
 
 
 def theme(root: tk.Tk) -> str:
-    """Windows 11 dark, in clam (the native "vista" theme ignores colors). Returns the accent color."""
+    """The SILVADES look, in clam (the native "vista" theme ignores colors). Returns the accent color."""
     global K
     K = root.winfo_fpixels("1i") / 96
-    have, lit = set(tkfont.families(root)), accent()
+    for ttf in (ASSETS / "fonts").glob("*.ttf"):  # the brand fonts, for this process only (nothing installed)
+        with contextlib.suppress(AttributeError, OSError):
+            ctypes.windll.gdi32.AddFontResourceExW(str(ttf), 0x10, 0)  # FR_PRIVATE
+    have, lit = set(tkfont.families(root)), NEON
     pick = lambda *names: next((n for n in names if n in have), names[-1])  # noqa: E731
-    text, strong = pick("Segoe UI Variable Text", "Segoe UI"), pick("Segoe UI Variable Text Semibold", "Segoe UI Semibold")
+    text, display = pick("IBM Plex Mono", "Cascadia Mono", "Consolas"), pick("Oxanium", "Segoe UI Semibold")
     icons = pick("Segoe Fluent Icons", "Segoe MDL2 Assets")
     if icons not in have:
         ICONS.clear()
     root.configure(bg=WINDOW)
-    for k, v in (("background", "#2c2c2c"), ("foreground", TEXT), ("selectBackground", HOVER), ("font", (text, 10))):
+    for k, v in (("background", FIELD), ("foreground", TEXT), ("selectBackground", NEON), ("selectForeground", WINDOW),
+                 ("font", (text, 10))):
         root.option_add(f"*TCombobox*Listbox.{k}", v)  # the drop-down list is a classic widget
     s = ttk.Style(root)
     s.theme_use("clam")
     s.configure(".", background=CARD, foreground=TEXT, bordercolor=STROKE, selectforeground=TEXT, font=(text, 10))
-    s.configure("Title.TLabel", background=WINDOW, font=(pick("Segoe UI Variable Display Semib", "Segoe UI Semibold"), 15))
+    s.configure("Title.TLabel", background=WINDOW, foreground=NEON, font=(display, 20, "bold"))
+    s.configure("Brand.TLabel", background=WINDOW, foreground=TEXT3, font=(text, 9, "bold"))
     s.configure("Note.TLabel", background=WINDOW, foreground=TEXT3, font=(text, 9))
-    s.configure("Icon.TLabel", foreground=TEXT2, font=(icons, 13))
+    s.configure("Icon.TLabel", foreground=NEON, font=(icons, 13))
     s.configure("Dim.TLabel", foreground=TEXT2)
-    s.configure("Value.TLabel", font=(strong, 10))
+    s.configure("Value.TLabel", font=(text, 10, "bold"))
+    s.configure("Pad.TButton", padding=px(6, 6), font=(text, 9, "bold"), wraplength=px(80), justify="center")
+    strong = (text, 10, "bold")
     s.configure("TCombobox", arrowcolor=TEXT2, arrowsize=px(9), padding=px(9, 5, 4, 5))
     s.map("TCombobox", bordercolor=[("focus", lit)], **dict.fromkeys(
         ("fieldbackground", "background", "lightcolor", "darkcolor", "selectbackground"), [("hover", HOVER), ("", FIELD)]))
@@ -337,23 +316,36 @@ def theme(root: tk.Tk) -> str:
                 focuscolor=FIELD, padding=px(12, 6), font=(text, 10))
     s.map("TButton", background=[("pressed", RAIL), ("active", HOVER)], lightcolor=[("active", HOVER)],
           darkcolor=[("active", HOVER)], bordercolor=[("focus", lit)])
-    s.configure("Sound.TButton", padding=px(10, 10), font=(strong, 10), wraplength=px(120), justify="center")
+    s.configure("Sound.TButton", padding=px(10, 10), font=strong, wraplength=px(120), justify="center")
     s.configure("TCheckbutton", indicatorbackground=FIELD, indicatorforeground=lit, upperbordercolor=RAIL,
                 lowerbordercolor=RAIL, focuscolor=CARD, indicatorsize=px(15), indicatormargin=px(0, 0, 8, 0))
     s.map("TCheckbutton", background=[("active", CARD)], indicatorbackground=[("selected", lit), ("active", HOVER)],
-          indicatorforeground=[("selected", TEXT)])  # ticked: an accent box, as Windows 11 draws it
-    size, rail = px(20), tk.PhotoImage(width=2, height=px(20))  # Fluent's slider: a grey rail, a ringed accent thumb
+          indicatorforeground=[("selected", WINDOW)])  # ticked: a neon box
+    size, rail = px(20), tk.PhotoImage(width=2, height=px(20))  # the slider: a grey rail, a ringed neon thumb
     rail.put(CARD, to=(0, 0, 2, size))
     rail.put(RAIL, to=(0, (size - px(4)) // 2, 2, (size + px(4)) // 2))
-    root.images = [rail, *(disc(size, [(size / 2, "#4e4e4e"), (size / 2 - 1, "#454545"), (px(r), lit)]) for r in (6, 7, 5)),
-                   disc(px(32), [(px(16), lit), (px(11), WINDOW), (px(6), lit)], WINDOW)]  # the last: the window's icon
+    mark = 56 if K > 1.6 else 40 if K > 1.2 else 28  # the SD mark, near its drawn size
+    root.images = [rail, *(disc(size, [(size / 2, "#3a3a3a"), (size / 2 - 1, "#2a2a2a"), (px(r), lit)]) for r in (6, 7, 5)),
+                   tk.PhotoImage(file=str(ASSETS / f"sd-{mark}.png"))]  # the last: the SD mark, for headers
     s.element_create("Fluent.trough", "image", rail, sticky="ew")
     s.element_create("Fluent.slider", "image", root.images[1], ("pressed", root.images[3]), ("active", root.images[2]))
     s.layout("Fluent.Horizontal.TScale", [("Fluent.trough", {"sticky": "ew", "children": [
         ("Fluent.slider", {"side": "left", "sticky": ""})]})])
-    root.iconphoto(True, root.images[-1])
+    with contextlib.suppress(tk.TclError):
+        root.iconbitmap(default=str(ASSETS / "micmix.ico"))
     dark_titlebar(root)
     return lit
+
+
+def brand(parent: tk.Misc, subtitle: str) -> None:
+    """The header: SD mark, MICMIX, by SILVADES, and a line under it."""
+    row = tk.Frame(parent, bg=WINDOW)
+    row.pack(anchor="w", fill="x")
+    tk.Label(row, image=parent.nametowidget(".").images[-1], bg=WINDOW).pack(side="left", padx=(0, px(10)))
+    ttk.Label(row, text="MICMIX", style="Title.TLabel").pack(side="left")
+    ttk.Label(row, text="by SILVADES", style="Brand.TLabel").pack(side="left", padx=px(10, 0), pady=px(8, 0))
+    if subtitle:
+        ttk.Label(parent, text=subtitle, style="Note.TLabel").pack(anchor="w", pady=(px(4), px(14)))
 
 
 class App(tk.Tk):
@@ -370,11 +362,10 @@ class App(tk.Tk):
         self.keys: dict[str, list] = saved.get("keys", {})
         self.pressed, self.cache, self.key_labels, self.note = queue.Queue(), {}, {}, ("", 0.0)
         self.last_fade, self.tray_tip, self.closed = 0.25, bool(saved.get("tray_tip")), False
+        self.pop, self.pop_closed = None, 0.0  # the tray's pop-up panel, and when it last closed
         self.tray = Tray(self.pressed, self.shared, self.lit)
 
-        ttk.Label(self, text="MicMix", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(self, text="Your mic, your music and your sounds, together in one mic", style="Note.TLabel").pack(
-            anchor="w", pady=(0, px(14)))
+        brand(self, "Your mic, your music and your sounds, together in one mic")
         grid = card(self)
         grid.columnconfigure(2, weight=1)
         cable = next((d for d in audio.devices("waveOut") if audio.is_cable(d) and "16CH" not in d.upper()), "")
@@ -501,8 +492,84 @@ class App(tk.Tk):
     def set_fade(self, *_) -> None:
         voice, music = audio.gains(self.fade.get())
         self.shared.gain = voice, music
-        for label, gain in zip(self.levels, (voice, music)):
+        for label, gain in zip(self.levels + (self.pop_levels if self.pop else []), (voice, music) * 2):
             label.configure(text=f"{gain:.0%}")
+
+    def flyout(self) -> None:
+        """The pop-up by the clock, as Twinkle Tray's: the slider, the level, mute, voice isolation and the first
+        sounds. A click anywhere else, or on the icon again, closes it. Its controls share the window's variables."""
+        if self.pop:
+            self.close_flyout()
+            return
+        pop = self.pop = tk.Toplevel(self, bg=NEON)  # the 1px edge
+        pop.overrideredirect(True)
+        pop.attributes("-topmost", True)
+        body = tk.Frame(pop, bg=WINDOW, padx=px(16), pady=px(12))
+        body.pack(padx=1, pady=1)
+        brand(body, "")
+        tk.Frame(body, bg=WINDOW, height=px(10)).pack()
+        mixer = card(body, px(14))
+        mixer.columnconfigure(1, weight=1)
+        self.pop_levels = []
+        for col, name in ((0, "Voice"), (2, "Music")):
+            ttk.Label(mixer, text=name, style="Dim.TLabel").grid(row=0, column=col, sticky="w", pady=px(8, 0))
+            self.pop_levels.append(ttk.Label(mixer, style="Value.TLabel", width=5))
+            self.pop_levels[-1].grid(row=0, column=col + 1, sticky="w", padx=(px(8), 0), pady=px(8, 0))
+        ttk.Scale(mixer, from_=0, to=1, variable=self.fade, command=self.set_fade, length=px(300),
+                  style="Fluent.Horizontal.TScale").grid(row=1, column=0, columnspan=4, sticky="ew", pady=px(4))
+        self.pop_meter = self.bar(mixer, row=2, column=0, columnspan=4)
+        switches = tk.Frame(mixer, bg=CARD)
+        switches.grid(row=3, column=0, columnspan=4, sticky="w", pady=px(8, 10))
+        ttk.Checkbutton(switches, text="Mute mic", variable=self.muted, command=self.set_mute).pack(side="left",
+                                                                                                  padx=(0, px(16)))
+        ttk.Checkbutton(switches, text="Voice isolation", variable=self.isolate, command=self.restart).pack(side="left")
+        if names := self.sound_names()[:8]:
+            pads = card(body, px(10))
+            for i, name in enumerate(names):
+                ttk.Button(pads, text=Path(name).stem, style="Pad.TButton", command=lambda n=name: self.play(n)).grid(
+                    row=i // 4, column=i % 4, sticky="nsew", padx=px(0, 4), pady=px(8, 0) if i < 4 else px(4, 0))
+            for col in range(4):
+                pads.columnconfigure(col, weight=1, uniform="pad")
+            tk.Frame(pads, bg=CARD, height=px(6)).grid(row=2, column=0)
+        self.pop_status = ttk.Label(body, style="Note.TLabel", wraplength=px(330))
+        self.pop_status.pack(fill="x", pady=px(2, 10))
+        tools = tk.Frame(body, bg=WINDOW)
+        tools.pack(fill="x")
+        for text, command in (("Open MicMix", lambda: self.act("show")), ("Stop sounds", lambda: self.act("stop")),
+                              ("Quit", self.close)):
+            ttk.Button(tools, text=text, command=command).pack(side="left", padx=(0, px(6)))
+        self.set_fade()
+        area, at, gap = w.RECT(), w.POINT(), px(12)
+        user32.SystemParametersInfoW(0x30, 0, ctypes.byref(area), 0)  # SPI_GETWORKAREA: the screen minus the taskbar
+        user32.GetCursorPos(ctypes.byref(at))
+
+        def place(_=None) -> None:  # again whenever its size settles (the cards size themselves a moment later)
+            width, height = pop.winfo_reqwidth(), pop.winfo_reqheight()
+            x = min(max(at.x - width // 2, area.left + gap), area.right - width - gap)  # under the pointer, on screen
+            y = area.top + gap if at.y < area.top else area.bottom - height - gap  # by the taskbar, wherever it is
+            if (x, y) != getattr(pop, "at", None):  # moving it fires <Configure> again: only move when it changed
+                pop.at = x, y
+                pop.geometry(f"+{x}+{y}")
+        place()
+        pop.bind("<Configure>", lambda e: e.widget is pop and place())
+        pop.focus_force()
+        pop.bind("<FocusOut>", lambda e: self.after(150, self.flyout_focus))
+
+    def flyout_focus(self) -> None:
+        """Close the panel once the focus has gone elsewhere (a click outside it)."""
+        if not self.pop:
+            return
+        try:
+            inside = str(self.focus_get() or "").startswith(str(self.pop))
+        except (KeyError, tk.TclError):
+            inside = False
+        if not inside:
+            self.close_flyout()
+
+    def close_flyout(self) -> None:
+        if self.pop:
+            self.pop.destroy()
+            self.pop, self.pop_closed = None, time.monotonic()
 
     def set_gate(self, *_) -> None:
         on = self.gate.get() > GATE_OFF + 0.5
@@ -672,7 +739,11 @@ class App(tk.Tk):
             self.shared.clips.put(audio.STOP)
         elif action.startswith("sound:"):
             self.play(action[6:])
-        elif action == "show":  # from the tray icon, or MicMix started again
+        elif action == "flyout":  # a click on the tray icon; the click that just closed the panel doesn't reopen it
+            if time.monotonic() - self.pop_closed > 0.4:
+                self.flyout()
+        elif action == "show":  # the full window: from the panel, the tray menu, or MicMix started again
+            self.close_flyout()
             self.deiconify()
             self.lift()
             self.focus_force()
@@ -686,7 +757,8 @@ class App(tk.Tk):
         if self.closed:  # "quit" just closed the window
             return
         s, music = self.shared, self.music.get()
-        self.show(self.meter, 1 + audio.db(s.peak) / 60, self.lit)  # the top 60 dB
+        peak = s.peak
+        self.show(self.meter, 1 + audio.db(peak) / 60, self.lit)  # the top 60 dB
         self.show(self.mic_meter, 1 - audio.db(s.mic_peak) / GATE_OFF, self.lit if s.gate_open else RAIL)
         s.peak = s.mic_peak = 0
         if self.engine and self.engine.error:
@@ -706,6 +778,9 @@ class App(tk.Tk):
         if s.muted and self.engine and not self.engine.error:
             text = "Mic muted. " + text
         self.status.configure(text=text)
+        if self.pop:
+            self.show(self.pop_meter, 1 + audio.db(peak) / 60, self.lit)
+            self.pop_status.configure(text=text)
         self.after(50, self.poll)
 
     def save(self) -> None:
@@ -740,13 +815,11 @@ class App(tk.Tk):
 
 def main(args: list[str]) -> None:
     """The window; or, for the installer: --save-defaults FILE / --restore-defaults FILE (Windows' default devices,
-    which VB-CABLE's setup changes) and --icon FILE (writes the shortcut icon)."""
+    which VB-CABLE's setup changes)."""
     if args[:1] == ["--save-defaults"]:
         Path(args[1]).write_text(json.dumps(audio.defaults(), indent=1), encoding="utf-8")
     elif args[:1] == ["--restore-defaults"]:  # exit code 1 if Windows refused any (a device that's gone)
         sys.exit(1 if audio.set_defaults(json.loads(Path(args[1]).read_text(encoding="utf-8"))) else 0)
-    elif args[:1] == ["--icon"]:
-        Path(args[1]).write_bytes(icon(256, accent()))
     else:
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateMutexW.restype = w.HANDLE

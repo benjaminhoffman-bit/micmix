@@ -1,8 +1,12 @@
-# MicMix
+# MicMix by SILVADES
 
 Talk, play music and fire off sounds into Discord through one microphone. MicMix mixes your mic (with voice isolation and a noise gate) with the sound of one app you pick, the way OBS's Application Audio Capture does, plus a soundboard. Game sounds, notifications and Discord itself stay out. A slider fades between your voice and the music, keybinds work from any app, games included, and MicMix keeps running from its icon by the clock.
 
 ![MicMix](docs/micmix.png)
+
+Click its icon by the clock and a small panel pops up there, as Twinkle Tray's does: the voice/music slider, the level, Mute, Voice isolation and your first sounds.
+
+![The tray panel](docs/flyout.png)
 
 For Windows 10 (version 2004 or later) and Windows 11.
 
@@ -46,7 +50,7 @@ In Discord, open **User Settings**, then **Voice & Video**:
 - **Mute mic:** silences your voice. Music and sounds keep playing.
 - **Soundboard:** click **Add sounds…** (MP3, WAV, M4A, WMA, FLAC; up to 10 minutes each) or drop files into the folder that **Open folder** shows. Click a pad to play it into your mic. **Hear them too** plays them in your own headphones as well, except while Music from is those headphones. The slider next to Soundboard sets their volume, and **Stop sounds** silences them.
 - **Keybinds…:** set keys for mute, music on or off, music up and down (5% steps; up stops once music is full), stop sounds, and each sound. Click **Set**, then press the keys. Keys that type (letters, digits, Space) need Ctrl or Alt with them; F1 to F24 and the number pad work alone. Keybinds work in any app, games included. A key another app already holds shows "(another app has it)".
-- **Closing the window** keeps MicMix running from its icon in the notification area, by the clock. Windows hides new icons at first: click the **^** arrow by the clock to find it, and drag it next to the clock to keep it in sight. Click the icon to open MicMix. Right-click it to mute your mic, stop sounds, or **Quit MicMix**. Opening MicMix from the Start menu also brings it back.
+- **Closing the window** keeps MicMix running from its icon in the notification area, by the clock. Windows hides new icons at first: click the **^** arrow by the clock to find it, and drag it next to the clock to keep it in sight. Click the icon for the pop-up panel (click away, or on the icon again, to close it). Its **Open MicMix** button opens the full window. Right-click the icon to mute your mic, stop sounds, or **Quit MicMix**. Opening MicMix from the Start menu also brings the full window back.
 - **Taskbar:** MicMix shows up as its own app. To keep it there, right-click its taskbar button while it's open and choose **Pin to taskbar**.
 - **Stop:** right-click the MicMix icon by the clock (under **^** if it's hidden) and choose **Quit MicMix**. Discord then hears silence, so for calls without MicMix, set Discord's Input Device back to your real mic.
 
@@ -74,4 +78,4 @@ Open the MicMix folder (`%LOCALAPPDATA%\MicMix`) in File Explorer, type `cmd` in
 
 ## License
 
-Free to use, rights kept: see [LICENSE.txt](LICENSE.txt). VB-CABLE is VB-Audio's software under its own terms. MicMix doesn't include or install it; you get it from VB-Audio.
+Free to use, rights kept: see [LICENSE.txt](LICENSE.txt). The SILVADES name and SD mark are SilvaDes LLC's. The Oxanium and IBM Plex Mono fonts in `assets\fonts` are under the SIL Open Font License, whose texts sit beside them. VB-CABLE is VB-Audio's software under its own terms. MicMix doesn't include or install it; you get it from VB-Audio.

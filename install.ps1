@@ -133,7 +133,7 @@ function Restore-Defaults([string]$python) {
 function Add-Link([string]$path, [string]$target, [string]$arguments, [string]$about, [string]$appId = '') {
     $link = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
     $link.TargetPath, $link.Arguments, $link.WorkingDirectory = $target, $arguments, $Dest
-    $link.IconLocation, $link.Description = "$Dest\micmix.ico,0", $about
+    $link.IconLocation, $link.Description = "$Dest\assets\micmix.ico,0", $about
     $link.Save()
     if ($appId) { try { [MicMixAppId]::Set($path, $appId) } catch { } }  # only the taskbar grouping is lost
 }
@@ -175,7 +175,7 @@ try {
         }
         Stop-MicMix
         foreach ($file in $Files) { Copy-Item (Join-Path $from $file) $Dest -Force }
-        & $python "$Dest\micmix.pyw" --icon "$Dest\micmix.ico"
+        Copy-Item (Join-Path $from 'assets') $Dest -Recurse -Force  # the SILVADES fonts (with their licenses) and icon
         Say "Installed in $Dest"
 
         Step 'VB-CABLE, the virtual mic'

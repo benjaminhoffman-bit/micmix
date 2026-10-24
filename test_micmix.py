@@ -91,10 +91,10 @@ class Choices(unittest.TestCase):
         self.assertEqual(len(sent), 3)  # the voice kept going
         self.assertIn("your mic only", engine.warning)
 
-    def test_icon_is_an_ico_holding_a_png(self):
-        data = micmix.icon(16, "#0078d4")
-        self.assertEqual(data[:4], b"\0\0\1\0")
-        self.assertEqual(data[22:30], b"\x89PNG\r\n\x1a\n")
+    def test_brand_assets_ship(self):
+        for name in ("micmix.ico", "sd-28.png", "sd-40.png", "sd-56.png", "fonts/Oxanium.ttf", "fonts/OFL-Oxanium.txt",
+                     "fonts/IBMPlexMono-400.ttf", "fonts/IBMPlexMono-700.ttf", "fonts/OFL-IBM-Plex.txt"):
+            self.assertTrue((micmix.ASSETS / name).is_file(), name)
 
 
 if __name__ == "__main__":

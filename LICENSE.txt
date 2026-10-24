@@ -1,0 +1,22 @@
+MicMix
+Copyright (c) 2026 SilvaDes LLC. All rights reserved.
+
+You may download and use MicMix for free, and you may share an unchanged copy
+of this repository or a link to it.
+
+You may not:
+- sell MicMix, or charge for access to it;
+- share changed copies;
+- use the SilvaDes name or logo, except to refer to this project.
+
+You may change your own copy for your own use.
+
+MicMix is provided "as is", without warranty of any kind. SilvaDes LLC is not
+liable for any damage or loss that comes from using it.
+
+Parts made by others keep their own terms:
+- VB-CABLE, the virtual audio cable MicMix sends its sound through, is
+  VB-Audio's software. It is not part of MicMix; you get it from VB-Audio.
+- Python is not part of MicMix.
+
+Questions: open an issue on this repository.

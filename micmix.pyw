@@ -937,6 +937,7 @@ def main(args: list[str]) -> None:
             except Exception:  # under pythonw a start-up error would vanish without a trace
                 import traceback
                 user32.MessageBoxW(None, traceback.format_exc()[-1500:], "MicMix couldn't start", 0x10)
+            os._exit(0)  # all saved and closed: skip Python's shutdown, which can hang on a sound or tray thread
 
 
 if __name__ == "__main__":

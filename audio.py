@@ -88,6 +88,7 @@ kernel32.CreateEventW.restype = w.HANDLE
 kernel32.CreateEventW.argtypes = [ctypes.c_void_p, w.BOOL, w.BOOL, w.LPCWSTR]
 kernel32.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
 kernel32.CloseHandle.argtypes = [w.HANDLE]
+kernel32.OpenProcess.argtypes, kernel32.OpenProcess.restype = [w.DWORD, w.BOOL, w.DWORD], w.HANDLE
 kernel32.CreateToolhelp32Snapshot.restype = w.HANDLE
 kernel32.CreateToolhelp32Snapshot.argtypes = [w.DWORD, w.DWORD]
 kernel32.Process32FirstW.argtypes = kernel32.Process32NextW.argtypes = [w.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
@@ -194,6 +195,8 @@ def app_pid(exe: str) -> int | None:
     loop back in."""
     procs, exe = processes(), exe.lower()
     named = lambda pid: procs.get(pid, ("",))[0].lower() == exe  # noqa: E731
+    if not any(map(named, procs)):  # not running: skip the slow look at sound sessions (the engine asks every 2 s)
+        return None
 
     def top(pid: int) -> int:
         for _ in range(64):  # bounded: a reused pid could make a loop
@@ -618,15 +621,16 @@ class Loopback:
     everything on an output device (source = its MME id, as OBS's Desktop Audio).
     Lives on the sound thread: COM is started for that thread here."""
 
-    def __init__(self, source: int | str):
+    def __init__(self, source: int | str, pid: int | None = None):
         ole32.CoInitializeEx(None, 0)  # multithreaded
-        self.client, self.capture = ctypes.c_void_p(), ctypes.c_void_p()
+        self.client, self.capture, self.app = ctypes.c_void_p(), ctypes.c_void_p(), None
         self.buf, self.flowing = bytearray(), False
         try:
             if isinstance(source, str):
-                pid = app_pid(source)
+                pid = pid or app_pid(source)
                 if pid is None:
-                    raise OSError(f"{source} isn't running. Start it, then pick it again")
+                    raise OSError(f"{source} isn't running")
+                self.app = kernel32.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE: loopback never says it closed
                 self.client = app_client(pid)
             else:
                 self.client = device_client(source)
@@ -639,6 +643,8 @@ class Loopback:
 
     def block(self) -> bytes:
         """The next 20 ms. Silence while nothing plays: loopback then delivers nothing at all."""
+        if self.app and kernel32.WaitForSingleObject(self.app, 0) == 0:  # signalled: the app closed
+            raise OSError("the app closed")
         n, data, frames, flags = w.UINT(), ctypes.c_void_p(), w.UINT(), w.DWORD()
         next_packet(self.capture, ctypes.byref(n))
         while n.value:
@@ -665,6 +671,8 @@ class Loopback:
         for obj in (self.capture, self.client):
             if obj:
                 release(obj)
+        if self.app:
+            kernel32.CloseHandle(self.app)
         ole32.CoUninitialize()
 
 
@@ -678,16 +686,25 @@ class Engine(threading.Thread):
     """Mic in (through the gate), music and soundboard on top, out to Send to; the sounds also to monitor, your own
     headphones, when there is one. The mic's clock paces it all."""
 
-    def __init__(self, shared: SimpleNamespace, mic: int, out: int, music: int | str | None, monitor: int | None,
-                 isolate: bool = False):
+    def __init__(self, shared: SimpleNamespace, mic: int | None, out: int, music: int | str | None,
+                 monitor: int | None, isolate: bool = False):
         super().__init__(daemon=True)
         self.shared, self.devs, self.running, self.error, self.warning = shared, (mic, out, music, monitor), True, "", ""
-        self.isolate = isolate
+        self.isolate, self.found = isolate, None
         self.start()
 
     def note(self, text: str) -> None:
         """Add to what the status line says: one fallback doesn't hide another."""
         self.warning = " ".join(filter(None, (self.warning, text)))
+
+    def unnote(self, text: str) -> None:
+        """Take a note back once it no longer holds."""
+        self.warning = " ".join(self.warning.replace(text, "").split())
+
+    def look(self, exe: str) -> None:
+        """Whether the Music from app runs now. On its own thread: a look at every process takes ~40 ms with a thousand
+        of them, and the sound has only ~40 ms queued."""
+        self.found = app_pid(exe)
 
     def run(self) -> None:
         mic = out = music = monitor = None
@@ -696,14 +713,17 @@ class Engine(threading.Thread):
         with contextlib.suppress(queue.Empty):  # pad presses made while nothing ran must not all play at once now
             while True:
                 s.clips.get_nowait()
+        lost = ""  # what the status line says while the music is missing
         try:
-            if music_src == out_dev:
-                raise OSError("Music from is the device you send to, so the mix would loop into itself. If the "
-                              "cable became your Windows default output, set your headphones back as the default.")
+            if music_src == out_dev:  # it would loop into itself: no music, but the voice goes on
+                music_src = None
+                self.note("Live: your mic only. Music from is the device you send to, so the mix would loop into "
+                          "itself. If the cable became your Windows default output, set your headphones back as the "
+                          "default.")
             names = devices("waveIn")
             if all(map(is_cable, names)):  # none at all, or only the cable
                 raise OSError("No microphone found. Plug one in, then pick it under Microphone.")
-            if mic_dev >= len(names):
+            if mic_dev is None or mic_dev >= len(names):
                 raise OSError("Your microphone is gone (unplugged?). Plug it back in, then pick it under Microphone.")
             if is_cable(names[mic_dev]):
                 raise OSError("Microphone is the cable, so the mix would loop into itself. If the cable became your "
@@ -718,13 +738,14 @@ class Engine(threading.Thread):
             try:
                 music = None if music_src is None else Loopback(music_src)
             except OSError as e:  # no music is no reason to cut the voice
-                self.note(f"Live: your mic only. {e}.")
+                lost = f"Live: your mic only. {e}." + (" It comes in once it runs." if isinstance(music_src, str) else "")
+                self.note(lost)
             if music and music_src == monitor_dev:  # music takes your headphones whole: it would carry the sounds
                 self.note("Live. Hear them too is off while Music from is your headphones.")  # into the mix twice
             elif monitor_dev is not None and monitor_dev != out_dev:
                 with contextlib.suppress(OSError):  # hearing your own sounds is a nicety, never a reason to stop
                     monitor = Speaker(monitor_dev, "Your headphones")
-            gate, playing, stalls = Gate(), [], 0
+            gate, playing, stalls, ticks = Gate(), [], 0, 0
             last = (0.0 if s.muted else s.gain[0]), s.gain[1], s.board  # gains fade from block to block: no clicks
             while self.running:
                 voice = mic.read()
@@ -734,14 +755,24 @@ class Engine(threading.Thread):
                         raise OSError("The microphone stopped sending sound (unplugged?). Plug it back in, then "
                                       "pick it again.")
                     continue
-                stalls = 0
+                stalls, ticks = 0, ticks + 1
+                if not music and isinstance(music_src, str):  # the app isn't running: look for it every 2 s
+                    if self.found:  # a look found it
+                        with contextlib.suppress(OSError):
+                            music = Loopback(music_src, self.found)
+                            self.unnote(lost)
+                        self.found = None
+                    elif ticks % 100 == 0:
+                        threading.Thread(target=self.look, args=(music_src,), daemon=True).start()
                 try:
                     tune = music.block() if music else SILENCE
                 except OSError:
                     music.close()
                     music, tune = None, SILENCE
-                    self.note("Live: your mic only. The music stopped (app closed or device unplugged): pick it "
-                              "again under Music from.")
+                    lost = (f"Live: your mic only. {music_src} closed. Its music comes back when it runs again."
+                            if isinstance(music_src, str) else
+                            "Live: your mic only. The music stopped (device unplugged?): pick it again under Music from.")
+                    self.note(lost)
                 level = peak(voice)
                 g0, g1 = gate.step(level, s.gate)
                 now = (0.0 if s.muted else s.gain[0]), s.gain[1], s.board
@@ -771,17 +802,20 @@ class Engine(threading.Thread):
     def sounds(playing: list, s: SimpleNamespace, b0: float | None = None, b1: float | None = None) -> bytes | None:
         """The soundboard's next 20 ms, at a volume going from b0 to b1 (default: the board's), or None when nothing
         plays. playing: [pcm, position] pairs."""
+        fading = []  # stopped mid-play: they fade out over this block, so Stop doesn't click
         with contextlib.suppress(queue.Empty):
             while True:
                 clip = s.clips.get_nowait()
                 if clip == STOP:
+                    fading += [p for p in playing if p[1]]  # one that never started just goes
                     playing.clear()
                 else:
                     playing.append([clip, 0])
-        if not playing:
+        if not playing and not fading:
             return None
         b0, b1 = s.board if b0 is None else b0, s.board if b1 is None else b1
         parts = [(pcm[at:at + BLOCK].ljust(BLOCK, b"\0"), b0, b1) for pcm, at in playing]
+        parts += [(pcm[at:at + BLOCK].ljust(BLOCK, b"\0"), b0, 0.0) for pcm, at in fading]
         for p in playing:
             p[1] += BLOCK
         playing[:] = [p for p in playing if p[1] < len(p[0])]

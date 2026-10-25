@@ -4,7 +4,7 @@ Talk, play music and fire off sounds into Discord through one microphone. MicMix
 
 ![MicMix](docs/micmix.png)
 
-Click its icon by the clock and a small panel pops up there, as Twinkle Tray's does: the voice/music slider, the level, Mute, Voice isolation and your first sounds.
+Click its icon by the clock and a small panel pops up there, as Twinkle Tray's does: the voice/music slider, the level, Mute, Voice isolation and your first sounds. Double-click the icon for the full window.
 
 ![The tray panel](docs/flyout.png)
 
@@ -43,22 +43,22 @@ In Discord, open **User Settings**, then **Voice & Video**:
 - **Microphone:** the mic you talk into. If you use NVIDIA Broadcast, you can pick its mic instead to keep its noise removal on your voice.
 - **Music from:** the app your music plays in. Only that app goes in. A browser goes in with all its tabs, so don't pick the browser you run Discord in. The list shows apps that have sound open, as Windows' volume mixer does, so start playing if yours is missing. Below the apps are whole output devices, which take everything playing on that device (like OBS's Desktop Audio). If you pick one, keep Discord's output on a different device, or people hear themselves echo back.
 - **Send to:** CABLE Input. MicMix picks it by itself once VB-CABLE is installed.
-- **Slider:** left is voice only, the middle is both at full, and right is music only. Music under your voice usually sits around 10 to 20%.
+- **Slider:** left is voice only, the middle is both at full, and right is music only. Music under your voice usually sits around 10 to 20%. Click anywhere on a slider to put it there, then drag on if you like. The arrow keys move a selected slider 1% at a time, or 10% with Ctrl.
 - **Level:** what Discord gets: your voice, the music and your sounds together. If it keeps touching the right end, the sound distorts, so turn the music or the soundboard down.
 - **Voice isolation:** opens your mic the way speech apps do, so Windows can clean it up with its own noise removal (Voice Clarity on recent Windows 11, or your mic driver's). Not every PC has either, and Windows doesn't say which happened. To check, stay quiet with some room noise (a fan, typing) and watch the bar under the noise gate, then tick Voice isolation. If the bar drops, it's working; if not, leave it off. If Windows refuses the mic this way outright, MicMix says so and uses the plain mic.
 - **Noise gate:** mutes your mic between words, so keyboard clicks and room noise stay out. The bar under the gate's slider is your mic's level. Drag the gate just above where that bar sits while you're quiet. The bar turns grey while the gate is shut. All the way left turns the gate off.
 - **Mute mic:** silences your voice. Music and sounds keep playing.
 - **Soundboard:** click **Add sounds…** (MP3, WAV, M4A, WMA, FLAC; up to 10 minutes each) or drop files into the folder that **Open folder** shows. Click a pad to play it into your mic. **Hear them too** plays them in your own headphones as well, except while Music from is those headphones. The slider next to Soundboard sets their volume, and **Stop sounds** silences them.
 - **Keybinds…:** set keys for mute, music on or off, music up and down (5% steps; up stops once music is full), stop sounds, and each sound. Click **Set**, then press the keys. Keys that type (letters, digits, Space) need Ctrl or Alt with them; F1 to F24 and the number pad work alone. Keybinds work in any app, games included. A key another app already holds shows "(another app has it)".
-- **Closing the window** keeps MicMix running from its icon in the notification area, by the clock. Windows hides new icons at first: click the **^** arrow by the clock to find it, and drag it next to the clock to keep it in sight. Click the icon for the pop-up panel (click away, or on the icon again, to close it). Its **Open MicMix** button opens the full window. Right-click the icon to mute your mic, stop sounds, or **Quit MicMix**. Opening MicMix from the Start menu also brings the full window back.
+- **Closing the window** keeps MicMix running from its icon in the notification area, by the clock. Windows hides new icons at first: click the **^** arrow by the clock to find it, and drag it next to the clock to keep it in sight. Click the icon for the pop-up panel (click away, press Esc, or click the icon again to close it). Its **Open MicMix** button, or a double-click on the icon, opens the full window. Right-click the icon to mute your mic, stop sounds, or **Quit MicMix**. Opening MicMix from the Start menu also brings the full window back.
 - **Taskbar:** MicMix shows up as its own app. To keep it there, right-click its taskbar button while it's open and choose **Pin to taskbar**.
 - **Stop:** right-click the MicMix icon by the clock (under **^** if it's hidden) and choose **Quit MicMix**. Discord then hears silence, so for calls without MicMix, set Discord's Input Device back to your real mic.
 
-MicMix saves your picks and keybinds in `micmix.json` and your sounds in `sounds\`, next to the app. If the music app isn't running, or its sound stops, MicMix keeps sending your voice and says so in its status line.
+MicMix saves your picks and keybinds in `micmix.json` and your sounds in `sounds\`, next to the app. If the music app isn't running yet, or closes, MicMix keeps sending your voice, says so in its status line, and takes the music in again a second or two after the app starts. It also follows your devices: plug a headset in or out, or change Windows' default device, and MicMix opens the right ones again within a second.
 
 ## Troubleshooting
 
-- **No music in Discord.** Check that the app is playing. Turn off "exclusive mode" if your music app has it (TIDAL and foobar2000 do): it bypasses the Windows mixer, so nothing can capture the sound. If you restarted the music app, pick it again under Music from.
+- **No music in Discord.** Check that the app is playing. Turn off "exclusive mode" if your music app has it (TIDAL and foobar2000 do): it bypasses the Windows mixer, so nothing can capture the sound.
 - **No sound on your PC since installing VB-CABLE, or the music echoes in Discord.** Windows is playing into the cable. Press **Win+R**, type `mmsys.cpl` and press Enter. Right-click your real headphones or speakers, then choose **Set as Default Device** and **Set as Default Communication Device**. Do the same for your mic on the Recording tab.
 - **"...would loop into itself."** The cable became one of your Windows default devices. Fix it the same way.
 - **Discord hears nothing.** Discord's Input Device must be CABLE Output, and MicMix must be running.

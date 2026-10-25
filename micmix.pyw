@@ -38,7 +38,8 @@ GATE_OFF = -72  # the noise gate slider's far left (dBFS): off. The mic meter un
 MODIFIERS = ((0x11, 2, "Ctrl"), (0x12, 1, "Alt"), (0x10, 4, "Shift"), (0x5B, 8, "Win"), (0x5C, 8, "Win"))
 WM_HOTKEY, WM_QUIT, WM_CLOSE, MOD_NOREPEAT = 0x312, 0x12, 0x10, 0x4000
 APP_ID, TRAY_CLASS, WM_TRAY, WM_SHOW = "SilvaDes.MicMix", "MicMixTray", 0x8001, 0x8002  # WM_APP + 1, + 2
-WM_LBUTTONUP, WM_RBUTTONUP, MF_CHECKED, MF_SEPARATOR, TPM_RETURNCMD = 0x202, 0x205, 0x8, 0x800, 0x100
+WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP = 0x202, 0x203, 0x205
+MF_CHECKED, MF_SEPARATOR, TPM_RETURNCMD = 0x8, 0x800, 0x100
 NIM_ADD, NIM_MODIFY, NIM_DELETE, NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 0, 1, 2, 1, 2, 4, 0x10
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
 
@@ -54,6 +55,10 @@ class WNDCLASSW(ctypes.Structure):
     _fields_ = [("style", w.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
                 ("hInstance", w.HINSTANCE), ("hIcon", w.HICON), ("hCursor", w.HANDLE), ("hbrBackground", w.HBRUSH),
                 ("lpszMenuName", w.LPCWSTR), ("lpszClassName", w.LPCWSTR)]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", w.DWORD), ("rcMonitor", w.RECT), ("rcWork", w.RECT), ("dwFlags", w.DWORD)]
 
 
 user32, kernel32, shell32 = ctypes.WinDLL("user32"), ctypes.WinDLL("kernel32"), ctypes.WinDLL("shell32")
@@ -80,7 +85,10 @@ user32.SetForegroundWindow.argtypes = [w.HWND]
 user32.GetCursorPos.argtypes = [ctypes.POINTER(w.POINT)]
 user32.LoadImageW.argtypes = [w.HINSTANCE, w.LPCWSTR, w.UINT, ctypes.c_int, ctypes.c_int, w.UINT]
 user32.LoadImageW.restype = w.HANDLE
-user32.SystemParametersInfoW.argtypes = [w.UINT, w.UINT, ctypes.c_void_p, w.UINT]
+user32.MonitorFromPoint.argtypes, user32.MonitorFromPoint.restype = [w.POINT, w.DWORD], w.HANDLE
+user32.GetMonitorInfoW.argtypes = [w.HANDLE, ctypes.POINTER(MONITORINFO)]
+user32.GetParent.argtypes, user32.GetParent.restype = [w.HWND], w.HWND
+user32.GetWindowRect.argtypes = [w.HWND, ctypes.POINTER(w.RECT)]
 user32.DestroyIcon.argtypes = [w.HICON]
 kernel32.GetModuleHandleW.argtypes, kernel32.GetModuleHandleW.restype = [w.LPCWSTR], w.HMODULE
 shell32.Shell_NotifyIconW.argtypes = [w.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
@@ -154,6 +162,8 @@ class Tray(threading.Thread):
         if msg == WM_TRAY and lparam == WM_LBUTTONUP:  # a click: the pop-up panel by the clock
             user32.SetForegroundWindow(self.hwnd)  # MicMix may take the focus now, so the panel can close on click-away
             self.pressed.put("flyout")
+        elif msg == WM_TRAY and lparam == WM_LBUTTONDBLCLK:  # the full window (its button-up then finds the panel
+            self.pressed.put("show")                         # just closed, so it doesn't open again)
         elif msg == WM_SHOW:  # MicMix started a second time: the full window
             self.pressed.put("show")
         elif msg == WM_CLOSE:  # the installer, before it updates or removes MicMix: quit for real, saving settings
@@ -162,7 +172,7 @@ class Tray(threading.Thread):
             self.menu()
         elif msg == self.explorer_restarted:  # Explorer restarted and lost its icons: add ours back
             self.data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
-            shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self.data))
+            self.added = bool(shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self.data))) or self.added
         else:
             return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
         return 0
@@ -197,14 +207,29 @@ def key_name(event: tk.Event) -> str:
 
 
 def load() -> dict:
-    with contextlib.suppress(OSError, ValueError):
-        return json.loads(SETTINGS.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(SETTINGS.read_text(encoding="utf-8-sig"))  # -sig: a BOM from Notepad or PowerShell is fine
+        if isinstance(data, dict):
+            return data
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        pass
+    with contextlib.suppress(OSError):  # unreadable: kept as micmix.json.bad, not overwritten with the defaults
+        SETTINGS.replace(SETTINGS.with_suffix(".json.bad"))
     return {}
+
+
+def work_area(x: int, y: int) -> w.RECT:
+    """The screen at (x, y), minus its taskbar."""
+    info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+    user32.GetMonitorInfoW(user32.MonitorFromPoint(w.POINT(x, y), 2), ctypes.byref(info))  # 2: the nearest screen
+    return info.rcWork
 
 
 # SILVADES: neon #39FF14 on near-black #050505, Oxanium 700 headings, IBM Plex Mono labels (assets\fonts, OFL)
 WINDOW, CARD, STROKE, FIELD, HOVER, RAIL = "#050505", "#121212", "#222222", "#1a1a1a", "#262626", "#333333"
-TEXT, TEXT2, TEXT3, NEON = "#e0e0e0", "#9a9a9a", "#777777", "#39ff14"
+TEXT, TEXT2, TEXT3, NEON = "#e0e0e0", "#9a9a9a", "#808080", "#39ff14"
 ASSETS = HERE / "assets"
 ICONS = {"Microphone": "", "Music from": "", "Send to": ""}  # Segoe Fluent Icons / MDL2 Assets
 K = 1.0  # screen pixels per 96-DPI pixel, set by theme(); fonts are in points and scale by themselves
@@ -249,8 +274,9 @@ def card(parent: tk.Misc, pad: int = 0) -> tk.Frame:
 
 
 def scroller(parent: tk.Misc, most: int) -> tuple[tk.Frame, tk.Frame]:
-    """(outer, inner): place outer, fill inner. inner scrolls (wheel or bar) once it is taller than `most` pixels."""
-    outer = tk.Frame(parent, bg=CARD)
+    """(outer, inner): place outer, fill inner. inner scrolls (wheel or bar) once it is taller than `most` pixels;
+    outer.most can be lowered later (then call outer.fit)."""
+    outer, spin = tk.Frame(parent, bg=CARD), 0
     view = tk.Canvas(outer, bg=CARD, highlightthickness=0, width=1, height=1)
     bar = ttk.Scrollbar(outer, command=view.yview)
     view.configure(yscrollcommand=bar.set)
@@ -260,16 +286,23 @@ def scroller(parent: tk.Misc, most: int) -> tuple[tk.Frame, tk.Frame]:
 
     def fit(_=None) -> None:
         tall = inner.winfo_reqheight()
-        view.configure(height=min(tall, most), scrollregion=(0, 0, 0, tall))
-        if tall > most:
+        view.configure(width=inner.winfo_reqwidth(), height=min(tall, outer.most), scrollregion=(0, 0, 0, tall))
+        if tall > outer.most:
             bar.pack(side="right", fill="y")
         else:
             bar.pack_forget()
         view.itemconfigure(item, width=view.winfo_width())
+
+    def wheel(delta: str) -> None:  # 120 a notch; a touchpad sends smaller steps, which add up
+        nonlocal spin
+        spin -= int(delta)
+        view.yview_scroll(steps := int(spin / 120), "units")
+        spin -= steps * 120
+    outer.most, outer.fit = most, fit
     inner.bind("<Configure>", fit)
     view.bind("<Configure>", fit)
-    wheel = lambda e: view.yview_scroll(-e.delta // 120, "units")  # noqa: E731
-    outer.bind("<Enter>", lambda e: outer.bind_all("<MouseWheel>", wheel))
+    scroll = outer.register(wheel) + " %D"  # one Tcl command, freed with the scroller (not one per <Enter>)
+    outer.bind("<Enter>", lambda e: outer.bind_all("<MouseWheel>", scroll))
     outer.bind("<Leave>", lambda e: outer.unbind_all("<MouseWheel>"))
     return outer, inner
 
@@ -298,6 +331,7 @@ def theme(root: tk.Tk) -> str:
     for k, v in (("background", FIELD), ("foreground", TEXT), ("selectBackground", NEON), ("selectForeground", WINDOW),
                  ("font", (text, 10))):
         root.option_add(f"*TCombobox*Listbox.{k}", v)  # the drop-down list is a classic widget
+    root.option_add("*TCombobox.font", (text, 10))  # the field in the list's font
     s = ttk.Style(root)
     s.theme_use("clam")
     s.configure(".", background=CARD, foreground=TEXT, bordercolor=STROKE, selectforeground=TEXT, font=(text, 10))
@@ -317,20 +351,35 @@ def theme(root: tk.Tk) -> str:
     s.map("TButton", background=[("pressed", RAIL), ("active", HOVER)], lightcolor=[("active", HOVER)],
           darkcolor=[("active", HOVER)], bordercolor=[("focus", lit)])
     s.configure("Sound.TButton", padding=px(10, 10), font=strong, wraplength=px(120), justify="center")
-    s.configure("TCheckbutton", indicatorbackground=FIELD, indicatorforeground=lit, upperbordercolor=RAIL,
-                lowerbordercolor=RAIL, focuscolor=CARD, indicatorsize=px(15), indicatormargin=px(0, 0, 8, 0))
+    s.configure("TCheckbutton", indicatorbackground=FIELD, indicatorforeground=lit, upperbordercolor="#6a6a6a",
+                lowerbordercolor="#6a6a6a", focuscolor=CARD, indicatorsize=px(15), indicatormargin=px(0, 0, 8, 0))
     s.map("TCheckbutton", background=[("active", CARD)], indicatorbackground=[("selected", lit), ("active", HOVER)],
-          indicatorforeground=[("selected", WINDOW)])  # ticked: a neon box
-    size, rail = px(20), tk.PhotoImage(width=2, height=px(20))  # the slider: a grey rail, a ringed neon thumb
-    rail.put(CARD, to=(0, 0, 2, size))
-    rail.put(RAIL, to=(0, (size - px(4)) // 2, 2, (size + px(4)) // 2))
+          indicatorforeground=[("selected", WINDOW)], upperbordercolor=[("focus", TEXT)],
+          lowerbordercolor=[("focus", TEXT)])  # ticked: a neon box; a light edge while the keyboard is on it
+    s.configure("TScrollbar", troughcolor=CARD, background=RAIL, bordercolor=CARD, lightcolor=RAIL, darkcolor=RAIL,
+                arrowcolor=TEXT2, gripcount=0)
+    s.map("TScrollbar", **dict.fromkeys(("background", "lightcolor", "darkcolor"), [("pressed", TEXT3),
+                                                                                   ("active", "#4a4a4a")]))
+    size, wide = px(20), root.winfo_screenwidth()  # the slider: a grey rail, a ringed neon thumb
+    rail = tk.PhotoImage(width=wide, height=size)  # screen-wide, drawn in one go (a 2 px one is tiled: ~1 s a redraw)
+    rail.put(CARD, to=(0, 0, wide, size))
+    rail.put(RAIL, to=(0, (size - px(4)) // 2, wide, (size + px(4)) // 2))
+    thumbs = [disc(size, [(size / 2, edge), (size / 2 - px(ring), "#2a2a2a"), (px(r), lit)])  # normal, hover, held,
+              for r, edge, ring in ((6, "#3a3a3a", 1), (7, "#3a3a3a", 1), (5, "#3a3a3a", 1), (6, TEXT, 1.5))]  # focused
     mark = 56 if K > 1.6 else 40 if K > 1.2 else 28  # the SD mark, near its drawn size
-    root.images = [rail, *(disc(size, [(size / 2, "#3a3a3a"), (size / 2 - 1, "#2a2a2a"), (px(r), lit)]) for r in (6, 7, 5)),
-                   tk.PhotoImage(file=str(ASSETS / f"sd-{mark}.png"))]  # the last: the SD mark, for headers
-    s.element_create("Fluent.trough", "image", rail, sticky="ew")
-    s.element_create("Fluent.slider", "image", root.images[1], ("pressed", root.images[3]), ("active", root.images[2]))
+    root.images, root.mark = [rail, *thumbs], None
+    with contextlib.suppress(tk.TclError):  # no assets folder: only the logo is lost
+        root.mark = tk.PhotoImage(file=str(ASSETS / f"sd-{mark}.png"))
+    s.element_create("Fluent.trough", "image", rail, sticky="ew", width=2)  # width: ask for 2 px, not the screen's
+    s.element_create("Fluent.slider", "image", thumbs[0], ("pressed", thumbs[2]), ("active", thumbs[1]),
+                     ("focus", thumbs[3]))
     s.layout("Fluent.Horizontal.TScale", [("Fluent.trough", {"sticky": "ew", "children": [
         ("Fluent.slider", {"side": "left", "sticky": ""})]})])
+    # Tk's sliders step by 1 a click on the rail (held: again and again) and a key press: on a 0-1 slider, all the
+    # way. A click now puts the thumb where you click (as Windows' sliders do) and drags on from there; keys step 1%.
+    root.bind_class("TScale", "<Button-1>", "ttk::scale::Jump %W %x %y")
+    root.eval("proc ttk::scale::Increment {w delta} {if {[winfo exists $w]} {"
+              "$w set [expr {[$w get] + $delta * ([$w cget -to] - [$w cget -from]) / 100.0}]}}")
     with contextlib.suppress(tk.TclError):
         root.iconbitmap(default=str(ASSETS / "micmix.ico"))
     dark_titlebar(root)
@@ -341,11 +390,12 @@ def brand(parent: tk.Misc, subtitle: str) -> None:
     """The header: SD mark, MICMIX, by SILVADES, and a line under it."""
     row = tk.Frame(parent, bg=WINDOW)
     row.pack(anchor="w", fill="x")
-    tk.Label(row, image=parent.nametowidget(".").images[-1], bg=WINDOW).pack(side="left", padx=(0, px(10)))
+    if mark := parent.nametowidget(".").mark:
+        tk.Label(row, image=mark, bg=WINDOW).pack(side="left", padx=(0, px(10)))
     ttk.Label(row, text="MICMIX", style="Title.TLabel").pack(side="left")
     ttk.Label(row, text="by SILVADES", style="Brand.TLabel").pack(side="left", padx=px(10, 0), pady=px(8, 0))
     if subtitle:
-        ttk.Label(parent, text=subtitle, style="Note.TLabel").pack(anchor="w", pady=(px(4), px(14)))
+        ttk.Label(parent, text=subtitle, style="Note.TLabel").pack(anchor="w", pady=(px(2), px(10)))
 
 
 class App(tk.Tk):
@@ -353,15 +403,16 @@ class App(tk.Tk):
         with contextlib.suppress(AttributeError, OSError):
             ctypes.windll.shcore.SetProcessDpiAwareness(1)  # sharp text on scaled displays
         super().__init__()
+        self.withdraw()  # shown once it's built, not as an empty box first
         self.title("MicMix")
         self.lit = theme(self)
-        self.configure(padx=px(20), pady=px(16))
+        self.configure(padx=px(20), pady=px(12))
         self.minsize(px(420), 0)
         saved = load()
         self.shared, self.engine, self.hotkeys, self.dialog = audio.shared_state(), None, None, None
         self.keys: dict[str, list] = saved.get("keys", {})
         self.pressed, self.cache, self.key_labels, self.note = queue.Queue(), {}, {}, ("", 0.0)
-        self.last_fade, self.tray_tip, self.closed = 0.25, bool(saved.get("tray_tip")), False
+        self.last_fade, self.tray_tip, self.closed, self.ticks = 0.25, bool(saved.get("tray_tip")), False, 0
         self.pop, self.pop_closed = None, 0.0  # the tray's pop-up panel, and when it last closed
         self.tray = Tray(self.pressed, self.shared, self.lit)
 
@@ -413,8 +464,8 @@ class App(tk.Tk):
         self.hear = tk.BooleanVar(value=bool(saved.get("hear", True)))
         ttk.Checkbutton(board, text="Hear them too", variable=self.hear, command=self.restart).grid(
             row=0, column=3, sticky="e", padx=(px(12), 0))
-        pad_box, self.pads = scroller(board, px(270))  # about four rows of pads, then it scrolls
-        pad_box.grid(row=1, column=0, columnspan=4, sticky="ew", pady=px(4))
+        self.pad_box, self.pads = scroller(board, px(270))  # about four rows of pads, then it scrolls
+        self.pad_box.grid(row=1, column=0, columnspan=4, sticky="ew", pady=px(4))
         tools = tk.Frame(board, bg=CARD)
         tools.grid(row=2, column=0, columnspan=4, sticky="ew", pady=px(6, 10))
         for text, command in (("Add sounds…", self.add_sounds), ("Open folder", self.open_folder),
@@ -425,9 +476,9 @@ class App(tk.Tk):
         self.status.pack(fill="x", padx=px(2), pady=(px(6), 0))
         self.status.bind("<Configure>", lambda e: self.status.configure(wraplength=e.width))  # wrap at window width
 
-        SOUNDS.mkdir(exist_ok=True)
         self.shown_sounds: list[str] = []
         self.bind("<Activate>", lambda e: e.widget is self and self.draw_pads())  # files dropped in the folder
+        self.bind("<Configure>", lambda e: e.widget is self and self.fit_screen(e.height))
         self.protocol("WM_DELETE_WINDOW", self.hide)
         self.protocol("WM_SAVE_YOURSELF", self.save)  # Tk's word for Windows signing out or shutting down
         self.draw_pads()
@@ -437,6 +488,23 @@ class App(tk.Tk):
         self.rebind()
         self.restart()
         self.poll()
+        self.update_idletasks()
+        self.deiconify()
+
+    def fit_screen(self, height: int) -> None:
+        """Keep the whole window above the taskbar as it grows (at start, and as sounds are added): fewer rows of pads
+        before they scroll, then up the screen as far as it needs. A move alone (a drag) is left alone."""
+        if height == getattr(self, "fitted", None) or self.state() != "normal":  # not minimized or maximized
+            return
+        self.fitted, frame = height, w.RECT()
+        user32.GetWindowRect(user32.GetParent(self.winfo_id()), ctypes.byref(frame))  # with its title bar
+        area, tall = work_area((frame.left + frame.right) // 2, frame.top), frame.bottom - frame.top
+        room = area.bottom - area.top
+        if tall > room and self.pad_box.most > px(60):  # taller than the screen: fewer pad rows
+            self.pad_box.most = max(px(60), min(self.pad_box.most, self.pads.winfo_reqheight()) - (tall - room))
+            self.pad_box.fit()
+        if (top := max(area.top, min(frame.top, area.bottom - tall))) != frame.top:
+            self.geometry(f"+{frame.left}+{top}")
 
     def bar(self, parent: tk.Frame, inset: int = 0, **grid) -> tk.Canvas:
         """A slim pill meter (rail + level), drawn in poll(). inset keeps its ends under a slider thumb's travel."""
@@ -456,23 +524,31 @@ class App(tk.Tk):
 
     def picker(self, grid: tk.Frame, row: int, label: str, names, saved: str | None, fallback: str) -> tk.StringVar:
         """A dropdown. Its list is read again each time it opens, so a device plugged in or an app started later shows
-        up. A picked app stays picked while it isn't playing."""
-        var = tk.StringVar(value=saved if saved in names() or audio.is_app(str(saved)) else fallback)
+        up. A pick stays picked while its app isn't playing or its device is unplugged."""
+        var = tk.StringVar(value=saved if isinstance(saved, str) and saved else fallback)
         if row:  # a hairline between rows, edge to edge
             tk.Frame(grid, height=1, bg=WINDOW).grid(row=2 * row - 1, column=0, columnspan=3, sticky="ew")
         ttk.Label(grid, text=ICONS.get(label, ""), style="Icon.TLabel").grid(row=2 * row, column=0, padx=(px(16), 0))
         ttk.Label(grid, text=label).grid(row=2 * row, column=1, sticky="w", padx=px(12, 16))
         box = ttk.Combobox(grid, textvariable=var, state="readonly", width=30)
         box.configure(postcommand=lambda: box.configure(values=names()))
-        box.grid(row=2 * row, column=2, sticky="ew", padx=(0, px(14)), pady=px(9))
+        box.grid(row=2 * row, column=2, sticky="ew", padx=(0, px(14)), pady=px(7))
         box.bind("<<ComboboxSelected>>", self.restart)
+        box.bind("<MouseWheel>", lambda e: "break")  # a stray scroll over it mustn't switch the device
         return var
+
+    def watched(self) -> tuple:
+        """What the engine was opened against: the devices there are and Windows' defaults. When it changes (a headset
+        plugged in or out, the default switched in Windows), the engine opens again and follows."""
+        return (audio.devices("waveIn"), audio.devices("waveOut"), audio.default_device("waveIn"),
+                audio.default_device("waveOut"))
 
     def restart(self, *_) -> None:
         """Open the picked devices (after closing the old ones). Without a Send to there is nothing to run."""
         self.stop()
+        self.watch = self.watched()
         mic = audio.device_id("waveIn", self.mic.get())
-        if mic in (None, audio.WAVE_MAPPER):  # default, or gone: use a real id, so a cable that became the default is caught
+        if mic == audio.WAVE_MAPPER:  # use a real id, so a cable that became the default is caught (None: gone)
             mic = audio.default_device("waveIn")
         out = audio.device_id("waveOut", self.out.get())
         music = self.music.get()
@@ -503,6 +579,8 @@ class App(tk.Tk):
             return
         pop = self.pop = tk.Toplevel(self, bg=NEON)  # the 1px edge
         pop.overrideredirect(True)
+        pop.protocol("WM_DELETE_WINDOW", self.close_flyout)  # Alt+F4: closed our way, so self.pop isn't left dead
+        pop.bind("<Escape>", lambda e: self.close_flyout())
         pop.attributes("-topmost", True)
         body = tk.Frame(pop, bg=WINDOW, padx=px(16), pady=px(12))
         body.pack(padx=1, pady=1)
@@ -539,17 +617,18 @@ class App(tk.Tk):
                               ("Quit", self.close)):
             ttk.Button(tools, text=text, command=command).pack(side="left", padx=(0, px(6)))
         self.set_fade()
-        area, at, gap = w.RECT(), w.POINT(), px(12)
-        user32.SystemParametersInfoW(0x30, 0, ctypes.byref(area), 0)  # SPI_GETWORKAREA: the screen minus the taskbar
+        at, gap = w.POINT(), px(12)
         user32.GetCursorPos(ctypes.byref(at))
+        area = work_area(at.x, at.y)  # the screen the icon is on, minus its taskbar
 
         def place(_=None) -> None:  # again whenever its size settles (the cards size themselves a moment later)
-            width, height = pop.winfo_reqwidth(), pop.winfo_reqheight()
+            width = pop.winfo_reqwidth()
             x = min(max(at.x - width // 2, area.left + gap), area.right - width - gap)  # under the pointer, on screen
-            y = area.top + gap if at.y < area.top else area.bottom - height - gap  # by the taskbar, wherever it is
+            y = (f"+{area.top + gap}" if at.y < area.top else  # by the taskbar, wherever it is. "-N": its bottom edge
+                 f"-{pop.winfo_screenheight() - area.bottom + gap}")  # stays put, so growing pushes it up, not under
             if (x, y) != getattr(pop, "at", None):  # moving it fires <Configure> again: only move when it changed
                 pop.at = x, y
-                pop.geometry(f"+{x}+{y}")
+                pop.geometry(f"+{x}{y}")
         place()
         pop.bind("<Configure>", lambda e: e.widget is pop and place())
         pop.focus_force()
@@ -584,7 +663,10 @@ class App(tk.Tk):
         self.shared.muted = self.muted.get()
 
     def sound_names(self) -> list[str]:
-        return sorted((p.name for p in SOUNDS.iterdir() if p.suffix.lower() in SOUND_TYPES), key=str.lower)
+        with contextlib.suppress(OSError):
+            SOUNDS.mkdir(exist_ok=True)  # deleted while MicMix runs: back, so Add sounds and Open folder still work
+            return sorted((p.name for p in SOUNDS.iterdir() if p.suffix.lower() in SOUND_TYPES), key=str.lower)
+        return []
 
     def draw_pads(self, force: bool = False) -> None:
         names = self.sound_names()
@@ -597,7 +679,7 @@ class App(tk.Tk):
             child.destroy()
         if not names:
             ttk.Label(self.pads, text="Add MP3, WAV or M4A files to play them into your mic.", style="Dim.TLabel").grid(
-                row=0, column=0, sticky="w", pady=px(4))
+                row=0, column=0, columnspan=4, sticky="w", pady=px(4))  # across the columns, not widening one
         for i, name in enumerate(names):
             key = self.keys.get(f"sound:{name}")
             pad = ttk.Button(self.pads, text=Path(name).stem + (f"\n{key[2]}" if key else ""), style="Sound.TButton",
@@ -645,6 +727,7 @@ class App(tk.Tk):
             self.dialog.lift()
             return
         top = self.dialog = tk.Toplevel(self, bg=WINDOW, padx=px(20), pady=px(16))
+        top.withdraw()  # shown once it's built
         top.title("MicMix keybinds")
         top.transient(self)
         ttk.Label(top, text="Keybinds", style="Title.TLabel").pack(anchor="w")
@@ -662,7 +745,7 @@ class App(tk.Tk):
         self.key_labels = {}
         for r, (action, label) in enumerate(rows):
             ttk.Label(body, text=label).grid(row=r, column=0, sticky="w", pady=px(3), padx=(0, px(16)))
-            shown = ttk.Label(body, style="Dim.TLabel", width=24)
+            shown = ttk.Label(body, style="Dim.TLabel", width=-24)  # -: at least that wide, wider for long text
             shown.grid(row=r, column=1, sticky="w")
             ttk.Button(body, text="Set", command=lambda a=action: self.capture(a)).grid(row=r, column=2, padx=px(6),
                                                                                        pady=px(3))
@@ -670,6 +753,7 @@ class App(tk.Tk):
             self.key_labels[action] = shown
         self.show_keys()
         dark_titlebar(top)
+        top.deiconify()
 
     def capture(self, action: str) -> None:
         if self.hotkeys:  # let go of MicMix's own keys meanwhile, or pressing one would run it instead of moving it
@@ -698,6 +782,7 @@ class App(tk.Tk):
 
     def bind_key(self, action: str, binding: list | None) -> None:
         """One action per key: binding a key takes it from whatever had it."""
+        self.dialog.unbind("<KeyPress>")  # Clear while a Set still listens: that Set is off
         for other, keys in list(self.keys.items()):
             if binding and keys[:2] == binding[:2]:
                 del self.keys[other]
@@ -751,15 +836,26 @@ class App(tk.Tk):
             self.close()
 
     def poll(self) -> None:
+        """Every 50 ms. One error in it mustn't stop it: keybinds, the tray and Quit all come through here."""
+        try:
+            self.tick()
+        finally:
+            if not self.closed:  # "quit" already closed the window
+                self.after(50, self.poll)
+
+    def tick(self) -> None:
         with contextlib.suppress(queue.Empty):
             while not self.closed:
                 self.act(self.pressed.get_nowait())
-        if self.closed:  # "quit" just closed the window
+        if self.closed:
             return
+        self.ticks += 1
+        if self.ticks % 20 == 0 and self.watched() != self.watch:  # once a second
+            self.restart()
         s, music = self.shared, self.music.get()
         peak = s.peak
         self.show(self.meter, 1 + audio.db(peak) / 60, self.lit)  # the top 60 dB
-        self.show(self.mic_meter, 1 - audio.db(s.mic_peak) / GATE_OFF, self.lit if s.gate_open else RAIL)
+        self.show(self.mic_meter, 1 - audio.db(s.mic_peak) / GATE_OFF, self.lit if s.gate_open else TEXT3)
         s.peak = s.mic_peak = 0
         if self.engine and self.engine.error:
             text = self.engine.error
@@ -773,6 +869,8 @@ class App(tk.Tk):
             text = "Live: your mic only. Pick the app your music plays in under Music from."
         elif audio.is_app(music):
             text = f"Live: your mic + {music}, nothing else."
+        elif self.engine.devs[2] is None:
+            text = f"Live: your mic only. {music} isn't plugged in."
         else:
             text = f"Live: your mic + everything playing on {music}."
         if s.muted and self.engine and not self.engine.error:
@@ -781,15 +879,16 @@ class App(tk.Tk):
         if self.pop:
             self.show(self.pop_meter, 1 + audio.db(peak) / 60, self.lit)
             self.pop_status.configure(text=text)
-        self.after(50, self.poll)
 
     def save(self) -> None:
         data = {"mic": self.mic.get(), "music": self.music.get(), "out": self.out.get(),
                 "fade": round(self.fade.get(), 3), "gate": round(self.gate.get(), 1),
                 "board": round(self.volume.get(), 3), "hear": self.hear.get(), "isolate": self.isolate.get(),
                 "keys": self.keys, "tray_tip": self.tray_tip}
-        with contextlib.suppress(OSError):
-            SETTINGS.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        with contextlib.suppress(OSError):  # written aside, then swapped in: a save cut short can't wipe it
+            new = SETTINGS.with_suffix(".tmp")
+            new.write_text(json.dumps(data, indent=1), encoding="utf-8")
+            new.replace(SETTINGS)
 
     def hide(self) -> None:
         """The close button: MicMix keeps your mic going from the notification area (when it has an icon there)."""
@@ -820,16 +919,16 @@ def main(args: list[str]) -> None:
         Path(args[1]).write_text(json.dumps(audio.defaults(), indent=1), encoding="utf-8")
     elif args[:1] == ["--restore-defaults"]:  # exit code 1 if Windows refused any (a device that's gone)
         sys.exit(1 if audio.set_defaults(json.loads(Path(args[1]).read_text(encoding="utf-8"))) else 0)
+    elif args[:1] and args[0].startswith("--"):  # an older installer's --icon: nothing to do, and no window
+        return
     else:
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateMutexW.restype = w.HANDLE
         running = k32.CreateMutexW(None, False, "Local\\MicMix")  # noqa: F841  (held until exit)
-        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS: a second copy would send everything twice
-            tray = user32.FindWindowW(TRAY_CLASS, None)
-            if tray:  # bring the running one's window up instead (it may be hidden in the tray)
-                user32.AllowSetForegroundWindow(-1)  # ASFW_ANY: hand it this start's right to come to the front
-                user32.PostMessageW(tray, WM_SHOW, 0, 0)
-            else:
+        if ctypes.get_last_error() in (183, 5):  # ALREADY_EXISTS; ACCESS_DENIED: one run as administrator holds it.
+            tray = user32.FindWindowW(TRAY_CLASS, None)  # A second copy would send everything twice: bring the
+            user32.AllowSetForegroundWindow(-1)  # running one's window up instead, handing it the right to come first
+            if not (tray and user32.PostMessageW(tray, WM_SHOW, 0, 0)):  # an elevated one can't be messaged from here
                 user32.MessageBoxW(None, "MicMix is already open. Look for it on the taskbar.", "MicMix", 0x40)
         else:
             shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)  # its own taskbar button, not Python's

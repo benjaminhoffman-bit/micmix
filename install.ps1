@@ -28,6 +28,8 @@ function Step([string]$text) { Write-Host ''; Write-Host "== $text" -ForegroundC
 
 function Find-Python {
     # a Python 3.10 or newer that has Tkinter; returns python.exe's full path
+    $env:PYTHONIOENCODING = 'utf-8'  # its path may hold any letter (a user folder like Jose with an accent)
+    try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch { }
     $tries = @()
     if (Get-Command py -ErrorAction SilentlyContinue) { $tries += , @('py', '-3') }
     if (Get-Command python -ErrorAction SilentlyContinue) { $tries += , @('python') }
@@ -36,7 +38,10 @@ function Find-Python {
     foreach ($try in $tries) {
         try {
             $exe = & $try[0] $try[1..9] -c 'import sys, tkinter; assert sys.version_info >= (3, 10); print(sys.executable)' 2>$null
-            if ($LASTEXITCODE -eq 0 -and $exe) { return ([string]($exe | Select-Object -Last 1)).Trim() }
+            if ($LASTEXITCODE -eq 0 -and $exe) {
+                $exe = ([string]($exe | Select-Object -Last 1)).Trim()
+                if (Test-Path -LiteralPath $exe) { return $exe }
+            }
         } catch { }
     }
     return $null
@@ -103,8 +108,8 @@ public static class MicMixAppId {
 }
 
 function Stop-MicMix {
-    # the copy installed here only
-    $running = @(Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+    # the copy installed here only, under any Python (python.exe, pythonw.exe, the Store's pythonw3.12.exe)
+    $running = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'python%'" |
         Where-Object { $_.CommandLine -like "*$Dest\micmix.pyw*" } | ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue })
     if (-not $running) { return }
     try { [void][MicMixAppId]::Quit() } catch { }
@@ -149,7 +154,10 @@ try {
         Remove-Item $Links -ErrorAction SilentlyContinue
         $keep = if ($NoStart) { 'y' } else { Read-Host '  Keep your sounds and settings, in case you install it again? (Y/n)' }
         if ($keep -match '^\s*n') { Remove-Item $Dest -Recurse -Force -ErrorAction SilentlyContinue }
-        else { Get-ChildItem $Dest -Exclude 'sounds', 'micmix.json' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force }
+        else {  # the record of your default devices too, while VB-CABLE's change is still to undo
+            Get-ChildItem $Dest -Exclude 'sounds', 'micmix.json', 'defaults-before-vbcable.json' -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force
+        }
         Say 'MicMix is removed. If you pinned it to the taskbar, right-click it there and choose Unpin from taskbar.'
         Say 'VB-CABLE stays: to remove it too, run its setup again and choose Remove Driver.'
         Say 'In Discord, set Input Device back to your real mic.'
@@ -176,6 +184,7 @@ try {
         Stop-MicMix
         foreach ($file in $Files) { Copy-Item (Join-Path $from $file) $Dest -Force }
         Copy-Item (Join-Path $from 'assets') $Dest -Recurse -Force  # the SILVADES fonts (with their licenses) and icon
+        if (Test-Path "$Dest\micmix.ico") { Copy-Item "$Dest\assets\micmix.ico" "$Dest\micmix.ico" -Force }  # old pins
         Say "Installed in $Dest"
 
         Step 'VB-CABLE, the virtual mic'
@@ -204,8 +213,12 @@ try {
         New-Item -ItemType Directory -Force $Programs, $Desktop | Out-Null
         Add-Link $Links[0] $pythonw "`"$Dest\micmix.pyw`"" 'MicMix: your mic, your music and your sounds in one mic' 'SilvaDes.MicMix'
         Add-Link $Links[1] $pythonw "`"$Dest\micmix.pyw`"" 'MicMix: your mic, your music and your sounds in one mic' 'SilvaDes.MicMix'
+        $where = ''  # an install made with -Dest, -Programs or -Desktop removes itself, not the usual one
+        foreach ($name in 'Dest', 'Programs', 'Desktop') {
+            if ($PSBoundParameters.ContainsKey($name)) { $where += " -$name `"$((Resolve-Path (Get-Variable $name -ValueOnly)).Path)`"" }
+        }
         Add-Link $Links[2] "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" `
-            "-NoProfile -ExecutionPolicy Bypass -File `"$Dest\install.ps1`" -Uninstall" 'Remove MicMix'
+            "-NoProfile -ExecutionPolicy Bypass -File `"$Dest\install.ps1`" -Uninstall$where" 'Remove MicMix'
         Say 'MicMix is in the Start menu and on the desktop. To keep it on the taskbar, right-click its taskbar'
         Say 'button once it opens and choose Pin to taskbar.'
 
@@ -213,7 +226,7 @@ try {
         Say 'Input Device: CABLE Output (VB-Audio Virtual Cable)'
         Say 'Input Profile: Custom. Noise Suppression: None. Echo Cancellation and Automatic Gain Control: off.'
         Say 'Input Sensitivity: turn off "Automatically determine" and drag the slider all the way left.'
-        if (-not $NoStart) { Start-Process $pythonw -ArgumentList "`"$Dest\micmix.pyw`"" -WorkingDirectory $Dest }
+        if (-not $NoStart) { Start-Process explorer.exe "`"$($Links[0])`"" }  # by Explorer: never as administrator
     }
 } catch {
     Write-Host ''

@@ -288,13 +288,15 @@ def capture_access() -> int | None:
         cf.CFRelease(service)
 
 
-SETTINGS_PANES = {"mic": "Privacy_Microphone", "capture": "Privacy_AudioCapture"}
+PAGES = {"mic": "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+         "capture": "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture",
+         "blackhole": "https://existential.audio/blackhole/"}
 
 
-def open_settings(pane: str) -> None:
-    """System Settings at Privacy & Security's Microphone ("mic") or System Audio Recording ("capture") page."""
-    os.spawnlp(os.P_NOWAIT, "open", "open",
-               f"x-apple.systempreferences:com.apple.preference.security?{SETTINGS_PANES[pane]}")
+def open_page(page: str) -> None:
+    """System Settings at Privacy & Security's Microphone ("mic") or System Audio Recording ("capture") page, or
+    BlackHole's own page."""
+    os.spawnlp(os.P_NOWAIT, "open", "open", PAGES[page])
 
 
 # --- sound: AudioQueue ---

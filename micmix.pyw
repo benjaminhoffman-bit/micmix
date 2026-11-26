@@ -455,7 +455,9 @@ class App(tk.Tk):
                            *([audio.ALL_APPS] if MAC else [DEFAULT, *audio.devices("waveOut")])]
         self.mic = self.picker(grid, 0, "Microphone", mics, saved.get("mic"), DEFAULT)
         self.music = self.picker(grid, 1, "Music from", sources, saved.get("music"), OFF)
-        self.out = self.picker(grid, 2, "Send to", lambda: audio.devices("waveOut"), saved.get("out"), cable)
+        outs = lambda: [d for d in audio.devices("waveOut") if not MAC or audio.is_cable(d)]  # noqa: E731
+        self.out = self.picker(grid, 2, "Send to", outs, saved.get("out"), cable)  # a Mac: only a virtual cable,
+        # since your own speakers or headphones would only play you back to yourself, and Discord can't hear them
 
         fader = card(self, px(16))
         fader.columnconfigure(2, weight=1)
@@ -504,11 +506,12 @@ class App(tk.Tk):
                               ("Stop sounds", lambda: self.shared.clips.put(audio.STOP)), ("Keybinds…", self.keybinds)):
             ttk.Button(tools, text=text, command=command).pack(side="left", padx=(0, px(6)))
 
-        self.status = ttk.Label(self, style="Note.TLabel", foreground=TEXT2)
+        self.status = ttk.Label(self, style="Note.TLabel", foreground=TEXT2, wraplength=px(500))  # a long one
+        # wraps from the start, instead of first stretching the window to fit on one line
         self.status.pack(fill="x", padx=px(2), pady=(px(6), 0))
         self.status.bind("<Configure>", lambda e: self.status.configure(wraplength=e.width))  # wrap at window width
         self.pane = None  # a Mac: the System Settings page the status line asks you to visit; a click opens it
-        self.status.bind("<Button-1>", lambda e: self.pane and mac.open_settings(self.pane))
+        self.status.bind("<Button-1>", lambda e: self.pane and mac.open_page(self.pane))
 
         self.shown_sounds: list[str] = []
         self.bind("<Activate>", lambda e: e.widget is self and self.draw_pads())  # files dropped in the folder
@@ -590,7 +593,9 @@ class App(tk.Tk):
         mic = audio.device_id("waveIn", self.mic.get())
         if mic == audio.WAVE_MAPPER:  # use a real id, so a cable that became the default is caught (None: gone)
             mic = audio.default_device("waveIn")
-        out = audio.device_id("waveOut", self.out.get())
+        if MAC and not audio.is_cable(self.out.get()):  # not a cable (an older pick, or none yet): the cable once
+            self.out.set(next((d for d in self.watch[1] if audio.is_cable(d) and "16CH" not in d.upper()), ""))
+        out = audio.device_id("waveOut", self.out.get())  # it's there, so installing BlackHole is all it takes
         music = self.music.get()
         if not audio.is_app(music):  # a whole device, or Off
             music = audio.device_id("waveOut", music)
@@ -940,7 +945,9 @@ class App(tk.Tk):
         if self.engine and self.engine.error:
             text = self.engine.error
         elif not self.engine:
-            text = f"Pick Send to. For a virtual mic, install {'BlackHole' if MAC else 'VB-CABLE'} first (see README.md)."
+            text = ("Send to needs BlackHole, the free virtual mic Discord listens to. Install BlackHole 2ch, and "
+                    "MicMix starts by itself." if MAC else
+                    "Pick Send to. For a virtual mic, install VB-CABLE first (see README.md).")
         elif MAC and mac.mic_access() == 0:  # the sound waits for the answer
             text = "macOS is asking whether MicMix may use your mic: click Allow in its window."
         elif time.monotonic() < self.note[1]:
@@ -960,8 +967,9 @@ class App(tk.Tk):
         if s.muted and self.engine and not self.engine.error:
             text = "Mic muted. " + text
         if MAC:
-            self.pane = ("mic" if "Microphone" in text else "capture") if "System Settings" in text else None
-            text += " Click here to open it." if self.pane else ""
+            self.pane = ("blackhole" if "BlackHole 2ch" in text else ("mic" if "Microphone" in text else "capture")
+                         if "System Settings" in text else None)
+            text += (" Click here to get it." if self.pane == "blackhole" else " Click here to open it.") if self.pane else ""
             self.status.configure(cursor="pointinghand" if self.pane else "")
         self.status.configure(text=text)
         if self.pop:

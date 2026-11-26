@@ -10,6 +10,7 @@ import ctypes
 import math
 import os
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -31,9 +32,11 @@ GATE_HOLD, GATE_FALL = 10, 0.2  # the gate stays open 200 ms (10 blocks) after t
 STOP = "stop"  # on the soundboard queue: silence every sound
 LONGEST_SOUND, TOO_LONG = 10 * 60 * RATE * CHANNELS * 2, "it's over 10 minutes long, too long for a sound"
 DEFAULT, OFF = "Windows default", "Off"
+WINDOWS = sys.platform == "win32"  # elsewhere (a Mac) mac.py's versions take over: see the end
 
-winmm, kernel32, ole32 = ctypes.WinDLL("winmm"), ctypes.WinDLL("kernel32"), ctypes.WinDLL("ole32")
-mmdevapi = ctypes.WinDLL("mmdevapi")
+if WINDOWS:  # Windows' own libraries
+    winmm, kernel32, ole32 = ctypes.WinDLL("winmm"), ctypes.WinDLL("kernel32"), ctypes.WinDLL("ole32")
+    mmdevapi = ctypes.WinDLL("mmdevapi")
 
 
 class WAVEFORMATEX(ctypes.Structure):
@@ -73,31 +76,32 @@ class PROCESSENTRY32W(ctypes.Structure):
 
 FORMAT = WAVEFORMATEX(1, CHANNELS, RATE, RATE * CHANNELS * 2, CHANNELS * 2, 16, 0)  # 1: plain PCM
 HDR, PTR = ctypes.POINTER(WAVEHDR), ctypes.POINTER(ctypes.c_void_p)
-for io in ("waveIn", "waveOut"):  # both APIs share these signatures; declared, so 64-bit handles pass whole
-    for name, args in {"Open": [ctypes.POINTER(w.HANDLE), w.UINT, ctypes.POINTER(WAVEFORMATEX), w.HANDLE,
-                                ctypes.c_size_t, w.DWORD],
-                       "PrepareHeader": [w.HANDLE, HDR, w.UINT], "UnprepareHeader": [w.HANDLE, HDR, w.UINT],
-                       "Reset": [w.HANDLE], "Close": [w.HANDLE], "GetNumDevs": [],
-                       "GetDevCapsW": [ctypes.c_size_t, ctypes.POINTER(CAPS), w.UINT],
-                       "GetErrorTextW": [w.UINT, w.LPWSTR, w.UINT],
-                       "Message": [w.HANDLE, w.UINT, ctypes.c_size_t, ctypes.c_size_t]}.items():
-        getattr(winmm, io + name).argtypes = args
-winmm.waveInAddBuffer.argtypes = winmm.waveOutWrite.argtypes = [w.HANDLE, HDR, w.UINT]
-winmm.waveInStart.argtypes = [w.HANDLE]
-kernel32.CreateEventW.restype = w.HANDLE
-kernel32.CreateEventW.argtypes = [ctypes.c_void_p, w.BOOL, w.BOOL, w.LPCWSTR]
-kernel32.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
-kernel32.CloseHandle.argtypes = [w.HANDLE]
-kernel32.OpenProcess.argtypes, kernel32.OpenProcess.restype = [w.DWORD, w.BOOL, w.DWORD], w.HANDLE
-kernel32.CreateToolhelp32Snapshot.restype = w.HANDLE
-kernel32.CreateToolhelp32Snapshot.argtypes = [w.DWORD, w.DWORD]
-kernel32.Process32FirstW.argtypes = kernel32.Process32NextW.argtypes = [w.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, w.DWORD]
-ole32.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, w.DWORD, ctypes.c_void_p, PTR]
-ole32.CoCreateInstance.restype = ctypes.HRESULT
-ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
-mmdevapi.ActivateAudioInterfaceAsync.argtypes = [w.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, PTR]
-mmdevapi.ActivateAudioInterfaceAsync.restype = ctypes.HRESULT
+if WINDOWS:  # their C signatures
+    for io in ("waveIn", "waveOut"):  # both APIs share these signatures; declared, so 64-bit handles pass whole
+        for name, args in {"Open": [ctypes.POINTER(w.HANDLE), w.UINT, ctypes.POINTER(WAVEFORMATEX), w.HANDLE,
+                                    ctypes.c_size_t, w.DWORD],
+                           "PrepareHeader": [w.HANDLE, HDR, w.UINT], "UnprepareHeader": [w.HANDLE, HDR, w.UINT],
+                           "Reset": [w.HANDLE], "Close": [w.HANDLE], "GetNumDevs": [],
+                           "GetDevCapsW": [ctypes.c_size_t, ctypes.POINTER(CAPS), w.UINT],
+                           "GetErrorTextW": [w.UINT, w.LPWSTR, w.UINT],
+                           "Message": [w.HANDLE, w.UINT, ctypes.c_size_t, ctypes.c_size_t]}.items():
+            getattr(winmm, io + name).argtypes = args
+    winmm.waveInAddBuffer.argtypes = winmm.waveOutWrite.argtypes = [w.HANDLE, HDR, w.UINT]
+    winmm.waveInStart.argtypes = [w.HANDLE]
+    kernel32.CreateEventW.restype = w.HANDLE
+    kernel32.CreateEventW.argtypes = [ctypes.c_void_p, w.BOOL, w.BOOL, w.LPCWSTR]
+    kernel32.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
+    kernel32.CloseHandle.argtypes = [w.HANDLE]
+    kernel32.OpenProcess.argtypes, kernel32.OpenProcess.restype = [w.DWORD, w.BOOL, w.DWORD], w.HANDLE
+    kernel32.CreateToolhelp32Snapshot.restype = w.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [w.DWORD, w.DWORD]
+    kernel32.Process32FirstW.argtypes = kernel32.Process32NextW.argtypes = [w.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, w.DWORD]
+    ole32.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, w.DWORD, ctypes.c_void_p, PTR]
+    ole32.CoCreateInstance.restype = ctypes.HRESULT
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    mmdevapi.ActivateAudioInterfaceAsync.argtypes = [w.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, PTR]
+    mmdevapi.ActivateAudioInterfaceAsync.restype = ctypes.HRESULT
 
 
 def guid(text: str) -> ctypes.Array:
@@ -119,24 +123,25 @@ IAUDIOCLIENT2 = guid("726778CD-F60A-4EDA-82DE-E47610CD78AA")
 HANDLER_IIDS = {uuid.UUID(i).bytes_le for i in ("00000000-0000-0000-C000-000000000046",  # IUnknown
                                                  "41D949AB-9862-444A-80F6-C261334DA5EB",  # the completion handler
                                                  "94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90")}  # IAgileObject: required
-query_interface, release = com(0, ctypes.c_void_p, PTR), ctypes.WINFUNCTYPE(ctypes.c_ulong)(2, "Release")  # IUnknown
-enum_endpoints, get_default = com(3, w.UINT, w.DWORD, PTR), com(4, w.UINT, w.UINT, PTR)  # IMMDeviceEnumerator
-get_device = com(5, w.LPCWSTR, PTR)
-device_count, device_item = com(3, ctypes.POINTER(w.UINT)), com(4, w.UINT, PTR)  # IMMDeviceCollection
-activate, get_id = com(3, ctypes.c_void_p, w.DWORD, ctypes.c_void_p, PTR), com(5, PTR)  # IMMDevice
-session_list = com(5, PTR)  # IAudioSessionManager2
-session_count, get_session = com(3, ctypes.POINTER(ctypes.c_int)), com(4, ctypes.c_int, PTR)  # IAudioSessionEnumerator
-session_pid = com(14, ctypes.POINTER(w.DWORD))  # IAudioSessionControl2
-activate_result = com(3, ctypes.POINTER(w.LONG), PTR)  # IActivateAudioInterfaceAsyncOperation
-initialize = com(3, ctypes.c_int, w.DWORD, ctypes.c_longlong, ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p)
-start, stop, get_service = com(10), com(11), com(14, ctypes.c_void_p, PTR)  # IAudioClient
-set_event_handle, set_client_properties = com(13, w.HANDLE), com(16, ctypes.c_void_p)  # IAudioClient, IAudioClient2
-get_buffer = com(3, PTR, ctypes.POINTER(w.UINT), ctypes.POINTER(w.DWORD), ctypes.c_void_p, ctypes.c_void_p)
-release_buffer, next_packet = com(4, w.UINT), com(5, ctypes.POINTER(w.UINT))  # IAudioCaptureClient
-set_default_endpoint = com(13, w.LPCWSTR, w.UINT)  # IPolicyConfig: undocumented, unchanged since Windows 7
-QUERY = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p, PTR)  # our one COM object's methods
-COUNT = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
-COMPLETED = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)
+if WINDOWS:  # COM methods
+    query_interface, release = com(0, ctypes.c_void_p, PTR), ctypes.WINFUNCTYPE(ctypes.c_ulong)(2, "Release")  # IUnknown
+    enum_endpoints, get_default = com(3, w.UINT, w.DWORD, PTR), com(4, w.UINT, w.UINT, PTR)  # IMMDeviceEnumerator
+    get_device = com(5, w.LPCWSTR, PTR)
+    device_count, device_item = com(3, ctypes.POINTER(w.UINT)), com(4, w.UINT, PTR)  # IMMDeviceCollection
+    activate, get_id = com(3, ctypes.c_void_p, w.DWORD, ctypes.c_void_p, PTR), com(5, PTR)  # IMMDevice
+    session_list = com(5, PTR)  # IAudioSessionManager2
+    session_count, get_session = com(3, ctypes.POINTER(ctypes.c_int)), com(4, ctypes.c_int, PTR)  # IAudioSessionEnumerator
+    session_pid = com(14, ctypes.POINTER(w.DWORD))  # IAudioSessionControl2
+    activate_result = com(3, ctypes.POINTER(w.LONG), PTR)  # IActivateAudioInterfaceAsyncOperation
+    initialize = com(3, ctypes.c_int, w.DWORD, ctypes.c_longlong, ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p)
+    start, stop, get_service = com(10), com(11), com(14, ctypes.c_void_p, PTR)  # IAudioClient
+    set_event_handle, set_client_properties = com(13, w.HANDLE), com(16, ctypes.c_void_p)  # IAudioClient, IAudioClient2
+    get_buffer = com(3, PTR, ctypes.POINTER(w.UINT), ctypes.POINTER(w.DWORD), ctypes.c_void_p, ctypes.c_void_p)
+    release_buffer, next_packet = com(4, w.UINT), com(5, ctypes.POINTER(w.UINT))  # IAudioCaptureClient
+    set_default_endpoint = com(13, w.LPCWSTR, w.UINT)  # IPolicyConfig: undocumented, unchanged since Windows 7
+    QUERY = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p, PTR)  # our one COM object's methods
+    COUNT = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+    COMPLETED = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)
 # ponytail: activation handlers are never freed, so a late call from Windows can't land in freed memory;
 # a few hundred bytes each time you pick an app
 HANDLERS = []
@@ -168,8 +173,9 @@ def default_device(io: str) -> int:
 
 def is_cable(name: str) -> bool:
     """An end of VB-CABLE, under either of the names Windows gives it ("CABLE Input (VB-Audio Virtual Cable)" or
-    "Speakers (VB-Audio Virtual Cable)", cut to 31 characters by MME)."""
-    return name.upper().startswith("CABLE") or "VB-AUDIO VIRTUAL" in name.upper()
+    "Speakers (VB-Audio Virtual Cable)", cut to 31 characters by MME); on a Mac, BlackHole or VB-Cable."""
+    name = name.upper()
+    return name.startswith(("CABLE", "BLACKHOLE")) or "VB-AUDIO VIRTUAL" in name or "VB-CABLE" in name
 
 
 def is_app(name: str) -> bool:
@@ -349,12 +355,13 @@ MF_MAJOR_TYPE, MF_SUBTYPE = guid("48EBA18E-F8C9-4687-BF11-0A74C9F96A8F"), guid("
 MF_AUDIO, MF_PCM = guid("73647561-0000-0010-8000-00AA00389B71"), guid("00000001-0000-0010-8000-00AA00389B71")
 MF_CHANNELS, MF_RATE = guid("37E48BF5-645E-4C5B-89DE-ADA9E29B696A"), guid("5FAEEAE7-0290-4C31-9E8A-C534F68D9DBA")
 MF_BITS = guid("F2DEB57F-40FA-4764-AA33-ED4F2D1FF669")
-set_uint32, set_guid = com(21, ctypes.c_void_p, w.UINT), com(24, ctypes.c_void_p, ctypes.c_void_p)  # IMFAttributes
-select_stream, set_media_type = com(4, w.DWORD, w.BOOL), com(7, w.DWORD, ctypes.c_void_p, ctypes.c_void_p)
-read_sample = com(9, w.DWORD, w.DWORD, ctypes.POINTER(w.DWORD), ctypes.POINTER(w.DWORD),  # IMFSourceReader
-                  ctypes.POINTER(ctypes.c_longlong), PTR)
-contiguous = com(41, PTR)  # IMFSample::ConvertToContiguousBuffer
-lock, unlock = com(3, PTR, ctypes.POINTER(w.DWORD), ctypes.POINTER(w.DWORD)), com(4)  # IMFMediaBuffer
+if WINDOWS:  # Media Foundation's methods
+    set_uint32, set_guid = com(21, ctypes.c_void_p, w.UINT), com(24, ctypes.c_void_p, ctypes.c_void_p)  # IMFAttributes
+    select_stream, set_media_type = com(4, w.DWORD, w.BOOL), com(7, w.DWORD, ctypes.c_void_p, ctypes.c_void_p)
+    read_sample = com(9, w.DWORD, w.DWORD, ctypes.POINTER(w.DWORD), ctypes.POINTER(w.DWORD),  # IMFSourceReader
+                      ctypes.POINTER(ctypes.c_longlong), PTR)
+    contiguous = com(41, PTR)  # IMFSample::ConvertToContiguousBuffer
+    lock, unlock = com(3, PTR, ctypes.POINTER(w.DWORD), ctypes.POINTER(w.DWORD)), com(4)  # IMFMediaBuffer
 
 
 def decode(path: str) -> bytes:
@@ -727,7 +734,8 @@ class Engine(threading.Thread):
                 raise OSError("Your microphone is gone (unplugged?). Plug it back in, then pick it under Microphone.")
             if is_cable(names[mic_dev]):
                 raise OSError("Microphone is the cable, so the mix would loop into itself. If the cable became your "
-                              "Windows default mic, set your real mic back as the default, or pick it here.")
+                              f"{'Windows' if WINDOWS else 'Mac'} default mic, set your real mic back as the default, "
+                              "or pick it here.")
             if self.isolate:
                 try:
                     mic = VoiceMic(mic_dev)
@@ -820,3 +828,8 @@ class Engine(threading.Thread):
             p[1] += BLOCK
         playing[:] = [p for p in playing if p[1] < len(p[0])]
         return mix(*parts)
+
+
+if sys.platform == "darwin":  # a Mac's devices, music capture, voice isolation and decoding, in place of Windows' above
+    from mac import (ALL_APPS, DEFAULT, Loopback, Mic, Speaker, VoiceMic, app_pid, decode,  # noqa: E402,F401
+                     default_device, device_id, devices, is_app, playing_apps)

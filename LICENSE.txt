@@ -19,6 +19,8 @@ Parts made by others keep their own terms:
   Font License 1.1; its texts (OFL-Oxanium.txt, OFL-IBM-Plex.txt) are there.
 - VB-CABLE, the virtual audio cable MicMix sends its sound through, is
   VB-Audio's software. It is not part of MicMix; you get it from VB-Audio.
-- Python is not part of MicMix.
+  On a Mac the same goes for BlackHole, Existential Audio's software.
+- Python is not part of MicMix (on a Mac, the installer downloads it from
+  python-build-standalone).
 
 Questions: open an issue on this repository.

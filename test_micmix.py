@@ -1,4 +1,8 @@
-"""MicMix's math and the choices around it, without any device. From this folder: py -m unittest test_micmix"""
+"""MicMix's math and the choices around it, without any device. From this folder: py -m unittest test_micmix
+(on a Mac: python/bin/python3 -m unittest test_micmix)"""
+import importlib.machinery
+import importlib.util
+import sys
 import tempfile
 import time
 import unittest
@@ -7,7 +11,14 @@ from pathlib import Path
 from unittest import mock
 
 import audio
-import micmix  # micmix.pyw: Windows imports .pyw sources
+
+try:
+    import micmix  # micmix.pyw: Windows imports .pyw sources
+except ModuleNotFoundError:  # macOS imports .py only: load it by its path
+    _loader = importlib.machinery.SourceFileLoader("micmix", str(Path(__file__).with_name("micmix.pyw")))
+    micmix = importlib.util.module_from_spec(importlib.util.spec_from_loader("micmix", _loader))
+    _loader.exec_module(micmix)
+MAC = sys.platform == "darwin"
 
 
 def block(*samples: int) -> bytes:
@@ -63,6 +74,7 @@ class Mixing(unittest.TestCase):
 
 
 class Choices(unittest.TestCase):
+    @unittest.skipUnless(audio.WINDOWS, "Windows' process trees")
     def test_app_pid_prefers_the_tree_with_sound(self):
         procs = {1: ("explorer.exe", 0), 10: ("App.exe", 1), 11: ("App.exe", 10),  # two separate App trees
                  20: ("App.exe", 1), 21: ("App.exe", 20)}
@@ -128,8 +140,67 @@ class Choices(unittest.TestCase):
 
     def test_brand_assets_ship(self):
         for name in ("micmix.ico", "sd-28.png", "sd-40.png", "sd-56.png", "fonts/Oxanium.ttf", "fonts/OFL-Oxanium.txt",
-                     "fonts/IBMPlexMono-400.ttf", "fonts/IBMPlexMono-700.ttf", "fonts/OFL-IBM-Plex.txt"):
+                     "fonts/IBMPlexMono-400.ttf", "fonts/IBMPlexMono-700.ttf", "fonts/OFL-IBM-Plex.txt",
+                     "micmix.icns", "Info.plist", "MicMix-launcher", "launcher.c"):  # the last four: MicMix.app
             self.assertTrue((micmix.ASSETS / name).is_file(), name)
+
+    def test_cables_on_both(self):
+        for name in ("CABLE Input (VB-Audio Virtual C", "Speakers (VB-Audio Virtual Cable)", "BlackHole 2ch", "VB-Cable"):
+            self.assertTrue(audio.is_cable(name), name)
+        self.assertFalse(audio.is_cable("MacBook Pro Speakers"))
+
+
+@unittest.skipUnless(MAC, "macOS only")
+class Mac(unittest.TestCase):
+    def test_helpers_count_as_their_app(self):
+        import mac
+        chrome = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/" \
+                 "Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper"
+        self.assertEqual(mac.bundle(chrome), "/Applications/Google Chrome.app")
+        self.assertEqual(mac.bundle("/usr/sbin/coreaudiod"), "")  # a part of macOS: never offered
+        self.assertTrue(mac.listed(1, "/Applications/Spotify.app"))
+        for path in ("/Applications/Discord.app", "/System/Library/CoreServices/ControlCenter.app", ""):
+            self.assertFalse(mac.listed(1, path), path)
+        self.assertTrue(mac.is_app("Spotify.app") and mac.is_app(mac.ALL_APPS) and not mac.is_app("BlackHole 2ch"))
+
+    def test_music_follows_the_apps_processes(self):
+        import mac
+        me = mac.os.getpid()
+        procs = [[(1, 10, "/Applications/Spotify.app"), (2, 20, "/Applications/Discord.app"), (3, me, "")]]
+
+        class FakeTap:
+            made = []
+
+            def __init__(self, processes, everything):
+                self.processes, self.everything, self.closed = processes, everything, False
+                FakeTap.made.append(self)
+
+            @staticmethod
+            def take():
+                return bytes(audio.BLOCK)
+
+            def close(self):
+                self.closed = True
+        with mock.patch.multiple(mac, Tap=FakeTap, sound_processes=lambda: procs[0], capture_access=lambda: 0):
+            music = mac.Loopback("Spotify.app")
+            self.assertEqual(music.processes, {1})
+            self.assertEqual(mac.Loopback(mac.ALL_APPS).processes, {2, 3})  # every app but Discord and MicMix
+            procs[0] = procs[0] + [(4, 11, "/Applications/Spotify.app")]  # its player started a helper
+            music.look()
+            music.block()
+            self.assertEqual((music.tap.processes, FakeTap.made[0].closed), ({1, 4}, True))  # swapped in, old one gone
+            procs[0] = [p for p in procs[0] if "Spotify" not in p[2]]  # quit
+            music.look()
+            with self.assertRaisesRegex(OSError, "closed"):
+                music.block()
+            with self.assertRaisesRegex(OSError, "isn't running"):
+                mac.Loopback("Spotify.app")
+
+    def test_decodes_a_mac_sound(self):
+        pcm = audio.decode("/System/Library/Sounds/Glass.aiff")  # on every Mac
+        self.assertEqual(len(pcm) % 4, 0)
+        self.assertGreater(len(pcm), audio.RATE * 4)  # over a second of 48 kHz 16-bit stereo
+        self.assertGreater(audio.peak(pcm), 1000)
 
 
 if __name__ == "__main__":

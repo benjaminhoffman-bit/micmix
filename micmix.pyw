@@ -6,9 +6,9 @@ the cable's other end ("CABLE Output") as the microphone in Discord. The slider 
 the middle. "Music from" takes one app (Spotify, a browser, your MP3 player) as OBS's Application Audio Capture does,
 so game sounds and Discord stay out; or everything playing on one output device, as OBS's Desktop Audio does.
 
-This file is the window, the keybinds and the installer's helpers; the sound is audio.py. Standard library only.
-The app needs no admin and changes no Windows setting. Picks, keybinds and the sliders are kept in micmix.json next to
-this file, sounds in sounds\\.
+This file is the window, the keybinds and the installer's helpers; the sound is audio.py. On a Mac, mac.py brings the
+menu bar icon, the keybinds and the Mac's sound. Standard library only. The app needs no admin and changes no system
+setting. Picks, keybinds and the sliders are kept in micmix.json next to this file, sounds in sounds\\.
 """
 import contextlib
 import ctypes
@@ -17,6 +17,7 @@ import math
 import os
 import queue
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -29,9 +30,13 @@ from tkinter import filedialog, ttk
 import audio
 from audio import DEFAULT, OFF
 
+MAC = sys.platform == "darwin"
+if MAC:
+    import mac
 HERE = Path(__file__).resolve().parent
 SETTINGS, SOUNDS = HERE / "micmix.json", HERE / "sounds"
-SOUND_TYPES = {".mp3", ".wav", ".m4a", ".aac", ".wma", ".flac", ".ogg", ".opus"}  # what Windows may decode
+SOUND_TYPES = ({".mp3", ".wav", ".m4a", ".aac", ".aif", ".aiff", ".caf", ".flac"} if MAC else  # what macOS decodes
+               {".mp3", ".wav", ".m4a", ".aac", ".wma", ".flac", ".ogg", ".opus"})  # what Windows may decode
 ACTIONS = {"mute": "Mute or unmute your mic", "music": "Music on or off", "up": "Music up", "down": "Music down",
            "stop": "Stop sounds"}
 GATE_OFF = -72  # the noise gate slider's far left (dBFS): off. The mic meter under it uses the same scale
@@ -41,57 +46,58 @@ APP_ID, TRAY_CLASS, WM_TRAY, WM_SHOW = "SilvaDes.MicMix", "MicMixTray", 0x8001, 
 WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP = 0x202, 0x203, 0x205
 MF_CHECKED, MF_SEPARATOR, TPM_RETURNCMD = 0x8, 0x800, 0x100
 NIM_ADD, NIM_MODIFY, NIM_DELETE, NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 0, 1, 2, 1, 2, 4, 0x10
-WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
+if not MAC:  # Windows' window, tray and keybind calls
+    WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
 
 
-class NOTIFYICONDATAW(ctypes.Structure):
-    _fields_ = [("cbSize", w.DWORD), ("hWnd", w.HWND), ("uID", w.UINT), ("uFlags", w.UINT), ("uCallbackMessage", w.UINT),
-                ("hIcon", w.HICON), ("szTip", w.WCHAR * 128), ("dwState", w.DWORD), ("dwStateMask", w.DWORD),
-                ("szInfo", w.WCHAR * 256), ("uVersion", w.UINT), ("szInfoTitle", w.WCHAR * 64), ("dwInfoFlags", w.DWORD),
-                ("guidItem", ctypes.c_ubyte * 16), ("hBalloonIcon", w.HICON)]
+    class NOTIFYICONDATAW(ctypes.Structure):
+        _fields_ = [("cbSize", w.DWORD), ("hWnd", w.HWND), ("uID", w.UINT), ("uFlags", w.UINT), ("uCallbackMessage", w.UINT),
+                    ("hIcon", w.HICON), ("szTip", w.WCHAR * 128), ("dwState", w.DWORD), ("dwStateMask", w.DWORD),
+                    ("szInfo", w.WCHAR * 256), ("uVersion", w.UINT), ("szInfoTitle", w.WCHAR * 64), ("dwInfoFlags", w.DWORD),
+                    ("guidItem", ctypes.c_ubyte * 16), ("hBalloonIcon", w.HICON)]
 
 
-class WNDCLASSW(ctypes.Structure):
-    _fields_ = [("style", w.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
-                ("hInstance", w.HINSTANCE), ("hIcon", w.HICON), ("hCursor", w.HANDLE), ("hbrBackground", w.HBRUSH),
-                ("lpszMenuName", w.LPCWSTR), ("lpszClassName", w.LPCWSTR)]
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [("style", w.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", w.HINSTANCE), ("hIcon", w.HICON), ("hCursor", w.HANDLE), ("hbrBackground", w.HBRUSH),
+                    ("lpszMenuName", w.LPCWSTR), ("lpszClassName", w.LPCWSTR)]
 
 
-class MONITORINFO(ctypes.Structure):
-    _fields_ = [("cbSize", w.DWORD), ("rcMonitor", w.RECT), ("rcWork", w.RECT), ("dwFlags", w.DWORD)]
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", w.DWORD), ("rcMonitor", w.RECT), ("rcWork", w.RECT), ("dwFlags", w.DWORD)]
 
 
-user32, kernel32, shell32 = ctypes.WinDLL("user32"), ctypes.WinDLL("kernel32"), ctypes.WinDLL("shell32")
-user32.RegisterHotKey.argtypes = [w.HWND, ctypes.c_int, w.UINT, w.UINT]
-user32.UnregisterHotKey.argtypes = [w.HWND, ctypes.c_int]
-user32.GetMessageW.argtypes = [ctypes.POINTER(w.MSG), w.HWND, w.UINT, w.UINT]
-user32.TranslateMessage.argtypes = user32.DispatchMessageW.argtypes = [ctypes.POINTER(w.MSG)]
-user32.PostThreadMessageW.argtypes = [w.DWORD, w.UINT, w.WPARAM, w.LPARAM]
-user32.PostMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
-user32.GetAsyncKeyState.argtypes, user32.GetAsyncKeyState.restype = [ctypes.c_int], ctypes.c_short
-user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
-user32.CreateWindowExW.argtypes = [w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                   ctypes.c_int, w.HWND, w.HMENU, w.HINSTANCE, ctypes.c_void_p]
-user32.CreateWindowExW.restype = w.HWND
-user32.DefWindowProcW.argtypes, user32.DefWindowProcW.restype = [w.HWND, w.UINT, w.WPARAM, w.LPARAM], ctypes.c_ssize_t
-user32.DestroyWindow.argtypes = [w.HWND]
-user32.FindWindowW.argtypes, user32.FindWindowW.restype = [w.LPCWSTR, w.LPCWSTR], w.HWND
-user32.RegisterWindowMessageW.argtypes = [w.LPCWSTR]
-user32.CreatePopupMenu.restype = w.HMENU
-user32.AppendMenuW.argtypes = [w.HMENU, w.UINT, ctypes.c_size_t, w.LPCWSTR]
-user32.TrackPopupMenu.argtypes = [w.HMENU, w.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, w.HWND, ctypes.c_void_p]
-user32.DestroyMenu.argtypes = [w.HMENU]
-user32.SetForegroundWindow.argtypes = [w.HWND]
-user32.GetCursorPos.argtypes = [ctypes.POINTER(w.POINT)]
-user32.LoadImageW.argtypes = [w.HINSTANCE, w.LPCWSTR, w.UINT, ctypes.c_int, ctypes.c_int, w.UINT]
-user32.LoadImageW.restype = w.HANDLE
-user32.MonitorFromPoint.argtypes, user32.MonitorFromPoint.restype = [w.POINT, w.DWORD], w.HANDLE
-user32.GetMonitorInfoW.argtypes = [w.HANDLE, ctypes.POINTER(MONITORINFO)]
-user32.GetParent.argtypes, user32.GetParent.restype = [w.HWND], w.HWND
-user32.GetWindowRect.argtypes = [w.HWND, ctypes.POINTER(w.RECT)]
-user32.DestroyIcon.argtypes = [w.HICON]
-kernel32.GetModuleHandleW.argtypes, kernel32.GetModuleHandleW.restype = [w.LPCWSTR], w.HMODULE
-shell32.Shell_NotifyIconW.argtypes = [w.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+    user32, kernel32, shell32 = ctypes.WinDLL("user32"), ctypes.WinDLL("kernel32"), ctypes.WinDLL("shell32")
+    user32.RegisterHotKey.argtypes = [w.HWND, ctypes.c_int, w.UINT, w.UINT]
+    user32.UnregisterHotKey.argtypes = [w.HWND, ctypes.c_int]
+    user32.GetMessageW.argtypes = [ctypes.POINTER(w.MSG), w.HWND, w.UINT, w.UINT]
+    user32.TranslateMessage.argtypes = user32.DispatchMessageW.argtypes = [ctypes.POINTER(w.MSG)]
+    user32.PostThreadMessageW.argtypes = [w.DWORD, w.UINT, w.WPARAM, w.LPARAM]
+    user32.PostMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
+    user32.GetAsyncKeyState.argtypes, user32.GetAsyncKeyState.restype = [ctypes.c_int], ctypes.c_short
+    user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+    user32.CreateWindowExW.argtypes = [w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, w.HWND, w.HMENU, w.HINSTANCE, ctypes.c_void_p]
+    user32.CreateWindowExW.restype = w.HWND
+    user32.DefWindowProcW.argtypes, user32.DefWindowProcW.restype = [w.HWND, w.UINT, w.WPARAM, w.LPARAM], ctypes.c_ssize_t
+    user32.DestroyWindow.argtypes = [w.HWND]
+    user32.FindWindowW.argtypes, user32.FindWindowW.restype = [w.LPCWSTR, w.LPCWSTR], w.HWND
+    user32.RegisterWindowMessageW.argtypes = [w.LPCWSTR]
+    user32.CreatePopupMenu.restype = w.HMENU
+    user32.AppendMenuW.argtypes = [w.HMENU, w.UINT, ctypes.c_size_t, w.LPCWSTR]
+    user32.TrackPopupMenu.argtypes = [w.HMENU, w.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, w.HWND, ctypes.c_void_p]
+    user32.DestroyMenu.argtypes = [w.HMENU]
+    user32.SetForegroundWindow.argtypes = [w.HWND]
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(w.POINT)]
+    user32.LoadImageW.argtypes = [w.HINSTANCE, w.LPCWSTR, w.UINT, ctypes.c_int, ctypes.c_int, w.UINT]
+    user32.LoadImageW.restype = w.HANDLE
+    user32.MonitorFromPoint.argtypes, user32.MonitorFromPoint.restype = [w.POINT, w.DWORD], w.HANDLE
+    user32.GetMonitorInfoW.argtypes = [w.HANDLE, ctypes.POINTER(MONITORINFO)]
+    user32.GetParent.argtypes, user32.GetParent.restype = [w.HWND], w.HWND
+    user32.GetWindowRect.argtypes = [w.HWND, ctypes.POINTER(w.RECT)]
+    user32.DestroyIcon.argtypes = [w.HICON]
+    kernel32.GetModuleHandleW.argtypes, kernel32.GetModuleHandleW.restype = [w.LPCWSTR], w.HMODULE
+    shell32.Shell_NotifyIconW.argtypes = [w.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
 
 
 class Hotkeys(threading.Thread):
@@ -227,12 +233,17 @@ def work_area(x: int, y: int) -> w.RECT:
     return info.rcWork
 
 
+if MAC:  # a Mac's keybinds and screens (mac.py) in place of the Windows ones above; its menu bar icon is mac.MenuBar
+    from mac import Hotkeys, work_area  # noqa: F811
+
+
 # SILVADES: neon #39FF14 on near-black #050505, Oxanium 700 headings, IBM Plex Mono labels (assets\fonts, OFL)
 WINDOW, CARD, STROKE, FIELD, HOVER, RAIL = "#050505", "#121212", "#222222", "#1a1a1a", "#262626", "#333333"
 TEXT, TEXT2, TEXT3, NEON = "#e0e0e0", "#9a9a9a", "#808080", "#39ff14"
 ASSETS = HERE / "assets"
 ICONS = {"Microphone": "", "Music from": "", "Send to": ""}  # Segoe Fluent Icons / MDL2 Assets
 K = 1.0  # screen pixels per 96-DPI pixel, set by theme(); fonts are in points and scale by themselves
+TITLE_BAR = 28  # a Mac window's title bar, in points
 
 
 def px(*n: float):
@@ -298,17 +309,27 @@ def scroller(parent: tk.Misc, most: int) -> tuple[tk.Frame, tk.Frame]:
         spin -= int(delta)
         view.yview_scroll(steps := int(spin / 120), "units")
         spin -= steps * 120
+    def touch(packed: str) -> None:  # a Mac's trackpad (Tk 9): pixels, packed two to a number
+        _, dy = (int(n) for n in view.tk.call("tk::PreciseScrollDeltas", packed))
+        view.yview_moveto(view.yview()[0] - dy / max(1, inner.winfo_reqheight()))
     outer.most, outer.fit = most, fit
     inner.bind("<Configure>", fit)
     view.bind("<Configure>", fit)
     scroll = outer.register(wheel) + " %D"  # one Tcl command, freed with the scroller (not one per <Enter>)
-    outer.bind("<Enter>", lambda e: outer.bind_all("<MouseWheel>", scroll))
-    outer.bind("<Leave>", lambda e: outer.unbind_all("<MouseWheel>"))
+    events = {"<MouseWheel>": scroll}
+    if MAC and outer.tk.call("info", "commands", "tk::PreciseScrollDeltas"):
+        events["<TouchpadScroll>"] = outer.register(touch) + " %D"
+    outer.bind("<Enter>", lambda e: [outer.bind_all(event, command) for event, command in events.items()])
+    outer.bind("<Leave>", lambda e: [outer.unbind_all(event) for event in events])
     return outer, inner
 
 
 def dark_titlebar(win: tk.Misc) -> None:
     win.update_idletasks()
+    if MAC:  # Tk's own switch for one window's look
+        with contextlib.suppress(tk.TclError):
+            win.tk.call("::tk::unsupported::MacWindowStyle", "appearance", win, "darkaqua")
+        return
     with contextlib.suppress(AttributeError, OSError):  # this window only
         hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(1)), 4)
@@ -317,6 +338,8 @@ def dark_titlebar(win: tk.Misc) -> None:
 def theme(root: tk.Tk) -> str:
     """The SILVADES look, in clam (the native "vista" theme ignores colors). Returns the accent color."""
     global K
+    if MAC:  # Tk counts in points there: 96 a point-inch makes every size what it is on Windows at 100%
+        root.tk.call("tk", "scaling", 96 / 72)
     K = root.winfo_fpixels("1i") / 96
     for ttf in (ASSETS / "fonts").glob("*.ttf"):  # the brand fonts, for this process only (nothing installed)
         with contextlib.suppress(AttributeError, OSError):
@@ -402,6 +425,8 @@ class App(tk.Tk):
     def __init__(self):
         with contextlib.suppress(AttributeError, OSError):
             ctypes.windll.shcore.SetProcessDpiAwareness(1)  # sharp text on scaled displays
+        if MAC:  # the brand fonts, for this process only; before Tk starts, which is when its font list catches up
+            mac.register_fonts(sorted((ASSETS / "fonts").glob("*.ttf")))
         super().__init__()
         self.withdraw()  # shown once it's built, not as an empty box first
         self.title("MicMix")
@@ -414,14 +439,20 @@ class App(tk.Tk):
         self.pressed, self.cache, self.key_labels, self.note = queue.Queue(), {}, {}, ("", 0.0)
         self.last_fade, self.tray_tip, self.closed, self.ticks = 0.25, bool(saved.get("tray_tip")), False, 0
         self.pop, self.pop_closed = None, 0.0  # the tray's pop-up panel, and when it last closed
-        self.tray = Tray(self.pressed, self.shared, self.lit)
+        if MAC:
+            self.tray = mac.MenuBar(self.pressed, self.shared, self.lit, str(ASSETS / "sd-40.png"))
+            self.mac_menus()
+            mac.keep_awake()
+        else:
+            self.tray = Tray(self.pressed, self.shared, self.lit)
 
         brand(self, "Your mic, your music and your sounds, together in one mic")
         grid = card(self)
         grid.columnconfigure(2, weight=1)
         cable = next((d for d in audio.devices("waveOut") if audio.is_cable(d) and "16CH" not in d.upper()), "")
         mics = lambda: [DEFAULT, *(d for d in audio.devices("waveIn") if not audio.is_cable(d))]  # no loops
-        sources = lambda: [OFF, *audio.playing_apps(), DEFAULT, *audio.devices("waveOut")]  # one app, or a device
+        sources = lambda: [OFF, *audio.playing_apps(),  # one app, or a whole device (a Mac: every app but Discord)
+                           *([audio.ALL_APPS] if MAC else [DEFAULT, *audio.devices("waveOut")])]
         self.mic = self.picker(grid, 0, "Microphone", mics, saved.get("mic"), DEFAULT)
         self.music = self.picker(grid, 1, "Music from", sources, saved.get("music"), OFF)
         self.out = self.picker(grid, 2, "Send to", lambda: audio.devices("waveOut"), saved.get("out"), cable)
@@ -443,8 +474,9 @@ class App(tk.Tk):
         switches = tk.Frame(fader, bg=CARD)
         switches.grid(row=7, column=0, columnspan=5, sticky="w", pady=px(4, 10))
         self.isolate, self.muted = tk.BooleanVar(value=bool(saved.get("isolate"))), tk.BooleanVar(value=False)
-        ttk.Checkbutton(switches, text="Voice isolation (Windows' noise removal, where your PC has it)",
-                        variable=self.isolate, command=self.restart).pack(side="left", padx=(0, px(20)))
+        ttk.Checkbutton(switches, text="Voice isolation (macOS's Mic Mode)" if MAC else
+                        "Voice isolation (Windows' noise removal, where your PC has it)",
+                        variable=self.isolate, command=self.set_isolate).pack(side="left", padx=(0, px(20)))
         ttk.Checkbutton(switches, text="Mute mic", variable=self.muted, command=self.set_mute).pack(side="left")
         self.gate = tk.DoubleVar(value=float(saved.get("gate", GATE_OFF)))
         ttk.Scale(fader, from_=GATE_OFF, to=0, variable=self.gate, command=self.set_gate,
@@ -475,6 +507,8 @@ class App(tk.Tk):
         self.status = ttk.Label(self, style="Note.TLabel", foreground=TEXT2)
         self.status.pack(fill="x", padx=px(2), pady=(px(6), 0))
         self.status.bind("<Configure>", lambda e: self.status.configure(wraplength=e.width))  # wrap at window width
+        self.pane = None  # a Mac: the System Settings page the status line asks you to visit; a click opens it
+        self.status.bind("<Button-1>", lambda e: self.pane and mac.open_settings(self.pane))
 
         self.shown_sounds: list[str] = []
         self.bind("<Activate>", lambda e: e.widget is self and self.draw_pads())  # files dropped in the folder
@@ -497,7 +531,11 @@ class App(tk.Tk):
         if height == getattr(self, "fitted", None) or self.state() != "normal":  # not minimized or maximized
             return
         self.fitted, frame = height, w.RECT()
-        user32.GetWindowRect(user32.GetParent(self.winfo_id()), ctypes.byref(frame))  # with its title bar
+        if MAC:  # Tk knows the content's place; macOS's title bar sits above it
+            frame.left, frame.right = self.winfo_rootx(), self.winfo_rootx() + self.winfo_width()
+            frame.top, frame.bottom = self.winfo_rooty() - TITLE_BAR, self.winfo_rooty() + self.winfo_height()
+        else:
+            user32.GetWindowRect(user32.GetParent(self.winfo_id()), ctypes.byref(frame))  # with its title bar
         area, tall = work_area((frame.left + frame.right) // 2, frame.top), frame.bottom - frame.top
         room = area.bottom - area.top
         if tall > room and self.pad_box.most > px(60):  # taller than the screen: fewer pad rows
@@ -528,7 +566,8 @@ class App(tk.Tk):
         var = tk.StringVar(value=saved if isinstance(saved, str) and saved else fallback)
         if row:  # a hairline between rows, edge to edge
             tk.Frame(grid, height=1, bg=WINDOW).grid(row=2 * row - 1, column=0, columnspan=3, sticky="ew")
-        ttk.Label(grid, text=ICONS.get(label, ""), style="Icon.TLabel").grid(row=2 * row, column=0, padx=(px(16), 0))
+        ttk.Label(grid, text=ICONS.get(label, ""), style="Icon.TLabel").grid(row=2 * row, column=0,
+                                                                              padx=(px(16), 0) if ICONS else 0)
         ttk.Label(grid, text=label).grid(row=2 * row, column=1, sticky="w", padx=px(12, 16))
         box = ttk.Combobox(grid, textvariable=var, state="readonly", width=30)
         box.configure(postcommand=lambda: box.configure(values=names()))
@@ -540,8 +579,9 @@ class App(tk.Tk):
     def watched(self) -> tuple:
         """What the engine was opened against: the devices there are and Windows' defaults. When it changes (a headset
         plugged in or out, the default switched in Windows), the engine opens again and follows."""
-        return (audio.devices("waveIn"), audio.devices("waveOut"), audio.default_device("waveIn"),
+        seen = (audio.devices("waveIn"), audio.devices("waveOut"), audio.default_device("waveIn"),
                 audio.default_device("waveOut"))
+        return seen + ((mac.mic_access(), mac.capture_access()) if MAC else ())  # a Mac: allowed in Settings later
 
     def restart(self, *_) -> None:
         """Open the picked devices (after closing the old ones). Without a Send to there is nothing to run."""
@@ -558,6 +598,9 @@ class App(tk.Tk):
                 music = audio.default_device("waveOut")  # loopback needs a real device, also checked against Send to
         monitor = audio.default_device("waveOut") if self.hear.get() else None
         self.engine = None if out is None else audio.Engine(self.shared, mic, out, music, monitor, self.isolate.get())
+        if MAC and self.engine and mic is not None and mac.bluetooth("waveIn", mic):
+            self.engine.note("Live. A Bluetooth headset's mic gives it phone-call sound: pick your Mac's own mic under "
+                             "Microphone to keep everything sounding full.")
         self.save()
 
     def stop(self) -> None:
@@ -600,7 +643,8 @@ class App(tk.Tk):
         switches.grid(row=3, column=0, columnspan=4, sticky="w", pady=px(8, 10))
         ttk.Checkbutton(switches, text="Mute mic", variable=self.muted, command=self.set_mute).pack(side="left",
                                                                                                   padx=(0, px(16)))
-        ttk.Checkbutton(switches, text="Voice isolation", variable=self.isolate, command=self.restart).pack(side="left")
+        ttk.Checkbutton(switches, text="Voice isolation", variable=self.isolate, command=self.set_isolate).pack(
+            side="left")
         if names := self.sound_names()[:8]:
             pads = card(body, px(10))
             for i, name in enumerate(names):
@@ -618,7 +662,11 @@ class App(tk.Tk):
             ttk.Button(tools, text=text, command=command).pack(side="left", padx=(0, px(6)))
         self.set_fade()
         at, gap = w.POINT(), px(12)
-        user32.GetCursorPos(ctypes.byref(at))
+        if MAC:  # it drops down from the menu bar icon
+            at.x, at.y = self.tray.where() or self.winfo_pointerxy()
+            mac.activate()  # MicMix comes first, so the panel takes keys (Esc) and closes when you click elsewhere
+        else:
+            user32.GetCursorPos(ctypes.byref(at))
         area = work_area(at.x, at.y)  # the screen the icon is on, minus its taskbar
 
         def place(_=None) -> None:  # again whenever its size settles (the cards size themselves a moment later)
@@ -645,10 +693,12 @@ class App(tk.Tk):
         if not inside:
             self.close_flyout()
 
-    def close_flyout(self) -> None:
+    def close_flyout(self, back: bool = True) -> None:
         if self.pop:
             self.pop.destroy()
             self.pop, self.pop_closed = None, time.monotonic()
+            if MAC and back and self.state() == "withdrawn" and mac.active():  # back to the app you were in (Esc)
+                mac.step_back()
 
     def set_gate(self, *_) -> None:
         on = self.gate.get() > GATE_OFF + 0.5
@@ -661,6 +711,13 @@ class App(tk.Tk):
 
     def set_mute(self) -> None:
         self.shared.muted = self.muted.get()
+        if MAC:
+            self.tray.muted(self.shared.muted)
+
+    def set_isolate(self) -> None:
+        self.restart()
+        if MAC and self.isolate.get() and mac.mic_mode() != 2:  # the switch is macOS's: its Mic Mode picker, once
+            self.after(1000, mac.show_mic_modes)  # MicMix's voice processing runs (it offers it to such apps only)
 
     def sound_names(self) -> list[str]:
         with contextlib.suppress(OSError):
@@ -719,7 +776,10 @@ class App(tk.Tk):
         self.draw_pads()
 
     def open_folder(self) -> None:
-        os.startfile(SOUNDS)
+        if MAC:
+            subprocess.Popen(["open", str(SOUNDS)])
+        else:
+            os.startfile(SOUNDS)
 
     def keybinds(self) -> None:
         """A window listing every action and sound with its keys: click Set, then press the keys."""
@@ -732,7 +792,9 @@ class App(tk.Tk):
         top.transient(self)
         ttk.Label(top, text="Keybinds", style="Title.TLabel").pack(anchor="w")
         ttk.Label(top, text="They work in any app, games included. Click Set, then press the keys (Esc cancels). Keys "
-                            "that type need Ctrl or Alt; F1-F24 and the number pad work alone.",
+                            + ("that type need ⌃, ⌥ or ⌘; F1-F20 and the number pad work alone (on a MacBook, hold fn "
+                               "for the F-keys)." if MAC else "that type need Ctrl or Alt; F1-F24 and the number pad "
+                                                             "work alone."),
                   style="Note.TLabel", wraplength=px(560)).pack(anchor="w", pady=(0, px(12)))
         box, body = scroller(card(top, px(16)), px(440))
         box.pack(fill="both", expand=True, pady=px(6))
@@ -742,6 +804,8 @@ class App(tk.Tk):
         rows = [*ACTIONS.items(), *((f"sound:{n}", f"Play {Path(n).stem}") for n in names),
                 *((f"sound:{n}", f"Play {Path(n).stem} (file gone)") for n in gone)]
         top.bind("<Destroy>", lambda e: e.widget is top and not self.hotkeys and self.rebind())  # closed mid-capture
+        if MAC:
+            top.bind("<Command-w>", lambda e: top.destroy())
         self.key_labels = {}
         for r, (action, label) in enumerate(rows):
             ttk.Label(body, text=label).grid(row=r, column=0, sticky="w", pady=px(3), padx=(0, px(16)))
@@ -763,21 +827,30 @@ class App(tk.Tk):
         self.dialog.focus_force()
 
         def pressed(event: tk.Event) -> None:
-            if event.keycode in (0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5):
+            key = mac.key_code(event) if MAC else event.keycode
+            if key in ((54, 55, 56, 57, 58, 59, 60, 61, 62, 63) if MAC else  # ⌘ ⇧ ⇪ ⌥ ⌃ fn
+                       (0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5)):
                 return  # a modifier on its own: wait for the key
             if event.keysym == "Escape":
                 self.dialog.unbind("<KeyPress>")
                 self.rebind()
                 self.show_keys()
                 return
-            held = [m for m in MODIFIERS if user32.GetAsyncKeyState(m[0]) & 0x8000]
-            mods = sum({m[1] for m in held})
-            if not mods & 11 and not 0x60 <= event.keycode <= 0x87:  # 11: Ctrl, Alt or Win; 0x60-0x87: numpad, F-keys
-                self.key_labels[action].configure(text="Add Ctrl or Alt (that key types)", foreground=self.lit)
+            if MAC:  # the modifiers come with the event; the keys that may go alone are the F-keys and the number pad
+                held = [m for m in mac.MODIFIERS if event.state & m[0]]
+                mods, need = sum(m[1] for m in held), "Add ⌃, ⌥ or ⌘ (that key types)"
+                typing = not mods & 0x1900 and key not in mac.ALONE  # 0x1900: Control, Option or Command
+                name = "".join(m[2] for m in held) + (mac.KEYS.get(key) or key_name(event))
+            else:
+                held = [m for m in MODIFIERS if user32.GetAsyncKeyState(m[0]) & 0x8000]
+                mods, need = sum({m[1] for m in held}), "Add Ctrl or Alt (that key types)"
+                typing = not mods & 11 and not 0x60 <= key <= 0x87  # 11: Ctrl, Alt or Win; 0x60-0x87: numpad, F-keys
+                name = "+".join([*dict.fromkeys(m[2] for m in held), key_name(event)])
+            if typing:
+                self.key_labels[action].configure(text=need, foreground=self.lit)
                 return  # a key that types would stop typing in every app: keep listening
             self.dialog.unbind("<KeyPress>")
-            name = "+".join([*dict.fromkeys(m[2] for m in held), key_name(event)])
-            self.bind_key(action, [mods, event.keycode, name])
+            self.bind_key(action, [mods, key, name])
         self.dialog.bind("<KeyPress>", pressed)
 
     def bind_key(self, action: str, binding: list | None) -> None:
@@ -828,7 +901,9 @@ class App(tk.Tk):
             if time.monotonic() - self.pop_closed > 0.4:
                 self.flyout()
         elif action == "show":  # the full window: from the panel, the tray menu, or MicMix started again
-            self.close_flyout()
+            self.close_flyout(back=False)
+            if MAC:
+                mac.dock(True)
             self.deiconify()
             self.lift()
             self.focus_force()
@@ -850,6 +925,11 @@ class App(tk.Tk):
         if self.closed:
             return
         self.ticks += 1
+        if MAC and self.pop:  # you clicked another app: the panel goes, as a Mac's menus do
+            if mac.active():
+                self.pop.was_active = True  # (MicMix comes forward a moment after the click)
+            elif getattr(self.pop, "was_active", False):
+                self.close_flyout()
         if self.ticks % 20 == 0 and self.watched() != self.watch:  # once a second
             self.restart()
         s, music = self.shared, self.music.get()
@@ -860,13 +940,17 @@ class App(tk.Tk):
         if self.engine and self.engine.error:
             text = self.engine.error
         elif not self.engine:
-            text = "Pick Send to. For a virtual mic, install VB-CABLE first (see README.md)."
+            text = f"Pick Send to. For a virtual mic, install {'BlackHole' if MAC else 'VB-CABLE'} first (see README.md)."
+        elif MAC and mac.mic_access() == 0:  # the sound waits for the answer
+            text = "macOS is asking whether MicMix may use your mic: click Allow in its window."
         elif time.monotonic() < self.note[1]:
             text = self.note[0]
         elif self.engine.warning:
             text = self.engine.warning
         elif music == OFF:
             text = "Live: your mic only. Pick the app your music plays in under Music from."
+        elif MAC and music == audio.ALL_APPS:
+            text = "Live: your mic + every app's sound but Discord's."
         elif audio.is_app(music):
             text = f"Live: your mic + {music}, nothing else."
         elif self.engine.devs[2] is None:
@@ -875,10 +959,27 @@ class App(tk.Tk):
             text = f"Live: your mic + everything playing on {music}."
         if s.muted and self.engine and not self.engine.error:
             text = "Mic muted. " + text
+        if MAC:
+            self.pane = ("mic" if "Microphone" in text else "capture") if "System Settings" in text else None
+            text += " Click here to open it." if self.pane else ""
+            self.status.configure(cursor="pointinghand" if self.pane else "")
         self.status.configure(text=text)
         if self.pop:
             self.show(self.pop_meter, 1 + audio.db(peak) / 60, self.lit)
             self.pop_status.configure(text=text)
+
+    def mac_menus(self) -> None:
+        """The Mac's menu bar while the window is open (MicMix's own About, Settings: the keybinds, Quit) and its
+        usual keys: ⌘W closes the window, ⌘Q quits. Opening MicMix again (Finder, Spotlight) brings the window back."""
+        bar = tk.Menu(self)
+        about = tk.Menu(bar, name="apple")
+        about.add_command(label="About MicMix", command=lambda: self.tk.call("tk::mac::standardAboutPanel"))
+        bar.add_cascade(menu=about)
+        self.configure(menu=bar)
+        for name, command in (("tk::mac::ReopenApplication", lambda: self.act("show")), ("tk::mac::Quit", self.close),
+                              ("tk::mac::ShowPreferences", self.keybinds)):
+            self.createcommand(name, command)
+        self.bind("<Command-w>", lambda e: self.hide())
 
     def save(self) -> None:
         data = {"mic": self.mic.get(), "music": self.music.get(), "out": self.out.get(),
@@ -896,10 +997,17 @@ class App(tk.Tk):
             self.close()
             return
         self.withdraw()
+        if MAC:
+            mac.dock(False)
         if not self.tray_tip:  # said once (set before saving, so it stays said)
             self.tray_tip = True
-            self.tray.notify("MicMix is still on", "Your mic keeps going. Click MicMix's icon by the clock (under ^ if "
-                                                   "Windows hid it) to open it; right-click it to quit.")
+            if MAC:  # the panel drops down from the icon: that shows where MicMix is now
+                self.note = ("MicMix is still on, up here. Click its icon for this panel; right-click it to quit.",
+                             time.monotonic() + 15)
+                self.after(400, self.flyout)
+            else:
+                self.tray.notify("MicMix is still on", "Your mic keeps going. Click MicMix's icon by the clock (under "
+                                                       "^ if Windows hid it) to open it; right-click it to quit.")
         self.save()
 
     def close(self) -> None:
@@ -912,6 +1020,12 @@ class App(tk.Tk):
         self.destroy()
 
 
+def alert(title: str, text: str) -> None:
+    """A Mac's own alert, without Tk (which may be what failed)."""
+    subprocess.run(["osascript", "-e", "on run {t, m}", "-e", "display alert t message m", "-e", "end run", title,
+                    text], capture_output=True)
+
+
 def main(args: list[str]) -> None:
     """The window; or, for the installer: --save-defaults FILE / --restore-defaults FILE (Windows' default devices,
     which VB-CABLE's setup changes)."""
@@ -921,6 +1035,20 @@ def main(args: list[str]) -> None:
         sys.exit(1 if audio.set_defaults(json.loads(Path(args[1]).read_text(encoding="utf-8"))) else 0)
     elif args[:1] and args[0].startswith("--"):  # an older installer's --icon: nothing to do, and no window
         return
+    elif MAC:
+        import fcntl
+        lock = open(HERE / ".micmix.lock", "w")  # held until exit: a second copy would send everything twice
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            alert("MicMix is already open", "Click its icon in the menu bar.")
+            return
+        try:
+            App().mainloop()
+        except Exception:  # started from its app icon, a start-up error would vanish without a trace
+            import traceback
+            alert("MicMix couldn't start", traceback.format_exc()[-1500:])
+        os._exit(0)  # all saved and closed: skip Python's shutdown, which can hang on a sound thread
     else:
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateMutexW.restype = w.HANDLE

@@ -6,3 +6,4 @@
 /sounds/
 /defaults-before-vbcable.json
 __pycache__/
+/.micmix.lock

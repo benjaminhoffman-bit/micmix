@@ -8,9 +8,11 @@ Click its icon by the clock and a small panel pops up there, as Twinkle Tray's d
 
 ![The tray panel](docs/flyout.png)
 
-For Windows 10 (version 2004 or later) and Windows 11.
+For Windows 10 (version 2004 or later) and Windows 11, and for Macs: macOS 14.2 or later (on macOS 11 to 14.1 everything but Music from works). On a Mac, MicMix lives in the menu bar; see [On a Mac](#on-a-mac).
 
 ## Install
+
+### Windows
 
 Press **Win+R**, paste this and press Enter:
 
@@ -29,11 +31,30 @@ The installer:
 
 Run it again any time to update; your settings and sounds stay. If you closed it before VB-CABLE was in, run it again afterwards and it puts your devices back then.
 
+### Mac
+
+Open **Terminal** (in Applications, Utilities), paste this and press Return:
+
+```
+curl -fsSL https://raw.githubusercontent.com/benjaminhoffman-bit/micmix/main/install.sh | bash
+```
+
+Or download the ZIP from this page, and in Terminal run `bash install.sh` in its folder.
+
+The installer:
+
+- gets MicMix its own Python (python-build-standalone, checked against its published checksum) and puts it, with MicMix, in `~/Library/Application Support/MicMix`. Nothing it does needs your password.
+- makes **MicMix.app** in your Applications folder (`~/Applications`), so it's in Launchpad and Spotlight.
+- opens Existential Audio's page for **BlackHole**, the free virtual audio cable MicMix sends its sound through on a Mac, and waits while you install it: get **BlackHole 2ch** and open its installer (it asks for your Mac's password, because it adds a driver). With Homebrew, `brew install blackhole-2ch` does the same. MicMix doesn't bundle BlackHole; you get it from Existential Audio. VB-Audio's VB-Cable for Mac works too.
+- then opens MicMix. The first time, macOS asks whether MicMix may use your microphone, and later whether it may record other apps' sound (for Music from): allow both.
+
+Run it again any time to update; your settings, sounds and those permissions stay.
+
 ## Set up Discord (once)
 
 In Discord, open **User Settings**, then **Voice & Video**:
 
-- **Input Device:** CABLE Output (VB-Audio Virtual Cable)
+- **Input Device:** CABLE Output (VB-Audio Virtual Cable). On a Mac: BlackHole 2ch.
 - **Input Profile:** Custom. The settings below only show up under Custom.
 - **Noise Suppression:** None. **Echo Cancellation:** off. **Automatic Gain Control:** off. All three chop up music.
 - **Input Sensitivity:** turn off "Automatically determine input sensitivity" and drag the slider to the far left. Otherwise quiet parts of songs cut out.
@@ -66,16 +87,44 @@ MicMix saves your picks and keybinds in `micmix.json` and your sounds in `sounds
 - **A sound won't play.** MicMix uses Windows' own decoders. Windows "N" editions need Microsoft's Media Feature Pack for them.
 - **MicMix doesn't open.** It shows a message saying why. If it doesn't help, open an issue on this page with that text.
 
+On a Mac:
+
+- **No music in Discord.** Check that the app is playing, and that macOS lets MicMix record other apps: System Settings, Privacy & Security, Screen & System Audio Recording, then turn on MicMix under **System Audio Recording Only**. When that's the problem, the status line says so; click it to go there.
+- **The bar under the noise gate never moves, or the status line starts with "Microphone:".** System Settings, Privacy & Security, Microphone: turn on MicMix. Click the status line to go there.
+- **Discord hears nothing.** Discord's Input Device must be BlackHole 2ch, MicMix must be running, and Discord needs the mic permission too (Privacy & Security, Microphone, Discord).
+- **No sound on your Mac, or the music echoes in Discord.** Your Mac is playing into BlackHole: System Settings, Sound, Output: pick your headphones or speakers. Under Input, pick your real mic.
+
 Your voice reaches Discord about 120 ms later than it would directly. That's buffering that keeps it from crackling.
+
+## On a Mac
+
+Everything above works the same, with these differences:
+
+- **Menu bar:** MicMix's icon, the SD mark, sits in the menu bar at the top right. Click it for the panel, right-click it (or Control-click) to mute your mic, stop sounds or **Quit MicMix**. The icon dims while your mic is muted.
+- **Closing the window** (or **⌘W**) keeps MicMix running from its menu bar icon, and it leaves the Dock until you open the window again. Opening MicMix again from Launchpad, Spotlight or Applications brings the window back. **⌘Q** quits, **⌘,** opens Keybinds.
+- **Microphone:** with AirPods or another Bluetooth headset, pick your Mac's own mic (MacBook Pro Microphone, say). Using the headset's mic turns it into a phone-call headset, and everything you hear on it gets that thin sound. The status line reminds you.
+- **Music from:** the apps macOS has a sound connection for, as on Windows; start playing if yours is missing. A browser goes in with all its tabs, and Safari's sound is found too. **All apps (not Discord)** takes every app's sound except Discord's and MicMix's own, like OBS's Desktop Audio but without the echo. It needs macOS 14.2 or later.
+- **Send to:** BlackHole 2ch. MicMix picks it by itself once it's installed.
+- **Voice isolation:** turns on macOS's voice processing for your mic, and macOS shows its **Mic Mode** choices: pick **Voice Isolation** (later: Control Center, Mic Mode). To check it, stay quiet with some room noise and watch the bar under the noise gate, as on Windows. While it's on, macOS counts MicMix as a call and turns other apps down a little; MicMix asks for the least. In Discord, leave Mic Mode on Standard, or it takes the music out too.
+- **Keybinds:** keys that type need ⌃, ⌥ or ⌘ with them; F1 to F20 and the number pad work alone. On a MacBook keyboard, hold **fn** for the F-keys (or turn on "Use F1, F2, etc. keys as standard function keys" in System Settings, Keyboard). They need no permission.
+- **Sounds:** MP3, WAV, AIFF, M4A, FLAC and CAF.
+- **Your files:** settings in `micmix.json` and sounds in `sounds/`, both in `~/Library/Application Support/MicMix` (Open folder shows it).
+- **Start at login:** System Settings, General, Login Items: click **+** and pick MicMix.
 
 ## Uninstall
 
 Start menu, then **Uninstall MicMix**. It asks whether to keep your sounds and settings. VB-CABLE stays installed: to remove it too, run its setup again and choose **Remove Driver**.
 
+On a Mac, in Terminal: `bash ~/Library/Application\ Support/MicMix/install.sh --uninstall`. It asks whether to keep your sounds and settings (if not, it also clears MicMix's permissions). BlackHole stays installed: to remove it too, follow Existential Audio's uninstall steps.
+
 ## Test
 
 Open the MicMix folder (`%LOCALAPPDATA%\MicMix`) in File Explorer, type `cmd` in the address bar and press Enter, then run `py -m unittest test_micmix` to check the mixing math.
 
+On a Mac, in Terminal: `cd ~/Library/Application\ Support/MicMix && python/bin/python3 -m unittest test_micmix`.
+
+MicMix.app's program is `assets/MicMix-launcher`, built from `assets/launcher.c` (the build command is at its top). It runs MicMix's Python inside the app, so macOS shows MicMix in the Dock and asks for its permissions as MicMix, not as Python.
+
 ## License
 
-Free to use, rights kept: see [LICENSE.txt](LICENSE.txt). The SILVADES name and SD mark are SilvaDes LLC's. The Oxanium and IBM Plex Mono fonts in `assets\fonts` are under the SIL Open Font License, whose texts sit beside them. VB-CABLE is VB-Audio's software under its own terms. MicMix doesn't include or install it; you get it from VB-Audio.
+Free to use, rights kept: see [LICENSE.txt](LICENSE.txt). The SILVADES name and SD mark are SilvaDes LLC's. The Oxanium and IBM Plex Mono fonts in `assets\fonts` are under the SIL Open Font License, whose texts sit beside them. VB-CABLE is VB-Audio's software and BlackHole is Existential Audio's, each under its own terms. MicMix doesn't include or install either; you get them from their makers. On a Mac, MicMix's Python comes from python-build-standalone, under Python's own license.

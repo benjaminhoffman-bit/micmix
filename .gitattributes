@@ -2,3 +2,7 @@
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
 *.png binary
+# macOS reads these: LF always, and binaries left alone
+*.sh text eol=lf
+*.icns binary
+assets/MicMix-launcher binary
